@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"net/http"
-	"strconv"
 
 	"github.com/gin-gonic/gin"
 	"github.com/joker782311/cryptoArbitrage/internal/exchange"
@@ -104,7 +103,6 @@ func SetAutoExecute(c *gin.Context) {
 
 // ListOrders 获取订单列表
 func ListOrders(c *gin.Context) {
-	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
 	c.JSON(http.StatusOK, gin.H{
 		"orders": []interface{}{},
 		"total":  0,
@@ -178,7 +176,6 @@ func GetPositionStats(c *gin.Context) {
 
 // ListAlerts 获取告警列表
 func ListAlerts(c *gin.Context) {
-	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
 	c.JSON(http.StatusOK, gin.H{
 		"alerts": []interface{}{},
 		"total":  0,

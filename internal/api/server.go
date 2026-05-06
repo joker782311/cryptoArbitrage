@@ -3,6 +3,7 @@ package api
 import (
 	"github.com/gin-gonic/gin"
 	"github.com/joker782311/cryptoArbitrage/internal/api/handlers"
+	"github.com/joker782311/cryptoArbitrage/internal/api/websocket"
 )
 
 // Server API 服务器
@@ -27,18 +28,12 @@ func NewServer() *Server {
 		c.Next()
 	})
 
-	return &Server{router: router}
-}
-
-// SetupRoutes 设置路由
-func (s *Server) SetupRoutes() {
-	// 健康检查
-	s.router.GET("/health", func(c *gin.Context) {
+	router.GET("/health", func(c *gin.Context) {
 		c.JSON(200, gin.H{"status": "ok"})
 	})
 
 	// API v1
-	v1 := s.router.Group("/api/v1")
+	v1 := router.Group("/api/v1")
 	{
 		// 行情
 		v1.GET("/tickers", handlers.GetTickers)
@@ -82,10 +77,12 @@ func (s *Server) SetupRoutes() {
 		v1.GET("/risk/stats", handlers.GetRiskStats)
 		v1.GET("/risk/limits", handlers.GetStrategyLimits)
 		v1.PUT("/risk/limits/:name", handlers.UpdateStrategyLimit)
+
+		// WebSocket
+		v1.GET("/ws", websocket.WebSocketHandler)
 	}
 
-	// WebSocket
-	v1.GET("/ws", handlers.WebSocketHandler)
+	return &Server{router: router}
 }
 
 // Run 启动服务器

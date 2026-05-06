@@ -3,11 +3,10 @@ package evm
 import (
 	"context"
 	"encoding/hex"
-	"fmt"
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/holiman/uint256"
 )
 
 // SwapParams 交换参数
@@ -65,8 +64,8 @@ func (r *UniswapV2Router) GetAmountsOut(ctx context.Context, amountIn *big.Int, 
 	}
 
 	data := "0xd06ca61f"
-	data += common.LeftPadBytes(amountIn.Bytes(), 32).Hex()[2:]
-	data += common.LeftPadBytes(big.NewInt(int64(len(path))).Bytes(), 32).Hex()[2:]
+	data += hex.EncodeToString(common.LeftPadBytes(amountIn.Bytes(), 32))
+	data += hex.EncodeToString(common.LeftPadBytes(big.NewInt(int64(len(path))).Bytes(), 32))
 	for _, addr := range pathAddresses {
 		data += addr.Hex()[2:]
 	}
@@ -87,14 +86,14 @@ func (r *UniswapV2Router) SwapExactTokensForTokens(ctx context.Context, params S
 	// method: swapExactTokensForTokens(uint amountIn, uint amountOutMin, address[] path, address to, uint deadline)
 
 	data := "0x38ed1739"
-	data += common.LeftPadBytes(params.AmountIn.Bytes(), 32).Hex()[2:]
-	data += common.LeftPadBytes(params.MinAmountOut.Bytes(), 32).Hex()[2:]
-	data += common.LeftPadBytes(big.NewInt(int64(len(path))).Bytes(), 32).Hex()[2:]
+	data += hex.EncodeToString(common.LeftPadBytes(params.AmountIn.Bytes(), 32))
+	data += hex.EncodeToString(common.LeftPadBytes(params.MinAmountOut.Bytes(), 32))
+	data += hex.EncodeToString(common.LeftPadBytes(big.NewInt(int64(len(path))).Bytes(), 32))
 	for _, p := range path {
 		data += common.HexToAddress(p).Hex()[2:]
 	}
 	data += common.HexToAddress(params.To).Hex()[2:]
-	data += common.LeftPadBytes(big.NewInt(int64(params.Deadline)).Bytes(), 32).Hex()[2:]
+	data += hex.EncodeToString(common.LeftPadBytes(big.NewInt(int64(params.Deadline)).Bytes(), 32))
 
 	// 发送交易
 	txHash, err := r.sendTransaction(ctx, data)
@@ -154,10 +153,10 @@ type ExactInputSingleParams struct {
 	TokenOut      common.Address
 	Fee           uint32
 	Recipient     common.Address
-	Deadline      uint256.Int
-	AmountIn      uint256.Int
-	AmountOutMinimum uint256.Int
-	SqrtPriceLimitX96 uint256.Int
+	Deadline      *uint256.Int
+	AmountIn      *uint256.Int
+	AmountOutMinimum *uint256.Int
+	SqrtPriceLimitX96 *uint256.Int
 }
 
 // ExactInputSingle V3 精确输入交换

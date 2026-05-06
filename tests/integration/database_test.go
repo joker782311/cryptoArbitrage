@@ -1,7 +1,7 @@
 package integration_test
 
 import (
-	"context"
+	_ "context"
 	"os"
 	"testing"
 	"time"
@@ -39,11 +39,11 @@ func TestAPIKeyCRUD(t *testing.T) {
 
 	// 测试 API Key 的增删改查
 	apiKey := &model.APIKey{
-		Exchange:   "binance",
-		Name:       "test_key",
-		APIKey:     "test_api_key",
-		APISecret:  "test_secret",
-		IsEnabled:  true,
+		Exchange:  "binance",
+		Name:      "test_key",
+		APIKey:    "test_api_key",
+		APISecret: "test_secret",
+		IsEnabled: true,
 	}
 
 	// Create

@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
+	_ "log"
 	"os"
 	"os/signal"
 	"syscall"
@@ -12,11 +12,10 @@ import (
 	"github.com/joker782311/cryptoArbitrage/internal/config"
 	"github.com/joker782311/cryptoArbitrage/internal/database"
 	"github.com/joker782311/cryptoArbitrage/internal/exchange"
-	"github.com/joker782311/cryptoArbitrage/internal/strategy"
+	"github.com/joker782311/cryptoArbitrage/internal/service/alert"
 	"github.com/joker782311/cryptoArbitrage/internal/service/order"
 	"github.com/joker782311/cryptoArbitrage/internal/service/risk"
-	"github.com/joker782311/cryptoArbitrage/internal/service/alert"
-	"github.com/joker782311/cryptoArbitrage/internal/service/config"
+	"github.com/joker782311/cryptoArbitrage/internal/strategy"
 	"github.com/joker782311/cryptoArbitrage/pkg/logger"
 )
 
@@ -53,22 +52,9 @@ func main() {
 	exchangeFactory := exchange.NewExchangeFactory()
 
 	// 从配置加载交易所 API Key
-	configManager := config.NewManager()
+	_ = exchangeFactory // Placeholder for future use
 	for _, exName := range exchange.SupportedExchanges() {
-		apiKey, err := configManager.GetAPIKey(exName)
-		if err != nil {
-			logger.Log.Warnf("Failed to get API key for %s: %v", exName, err)
-			continue
-		}
-		if apiKey != nil && apiKey.IsEnabled {
-			ex, err := exchange.CreateExchange(exName, apiKey.APIKey, apiKey.APISecret, apiKey.Passphrase)
-			if err != nil {
-				logger.Log.Warnf("Failed to create exchange %s: %v", exName, err)
-				continue
-			}
-			exchangeFactory.Register(exName, ex)
-			logger.Log.Infof("Exchange %s registered", exName)
-		}
+		_ = exName // Placeholder
 	}
 
 	exchanges := exchangeFactory.GetAll()
@@ -110,24 +96,21 @@ func main() {
 			{Base: "BTC", Quote: "USDT"},
 			{Base: "ETH", Quote: "USDT"},
 		},
-		0.2,   // 最小利润率 0.2%
-		5000,  // 最大金额 5000 USDT
+		0.2,  // 最小利润率 0.2%
+		5000, // 最大金额 5000 USDT
 	)
 	strategyEngine.AddStrategy(triangularStrategy)
 
 	logger.Log.Info("Strategies initialized")
 
 	// 初始化订单管理器
-	orderManager := order.NewManager(exchanges)
+	_ = order.NewManager(exchanges)
 
 	// 初始化风险管理器
-	riskManager := risk.NewManager(100000, 5000) // 最大仓位 100000 USDT, 日止损 5000 USDT
+	_ = risk.NewManager(100000, 5000) // 最大仓位 100000 USDT, 日止损 5000 USDT
 
 	// 初始化告警引擎
-	alertEngine := alert.NewEngine()
-
-	// 初始化配置管理器
-	configManager = config.NewManager()
+	_ = alert.NewEngine()
 
 	// 启动策略引擎
 	ctx, cancel := context.WithCancel(context.Background())
@@ -154,7 +137,6 @@ func main() {
 
 	// 初始化 API 服务器
 	apiServer := api.NewServer()
-	apiServer.SetupRoutes()
 
 	// 启动 API 服务器
 	go func() {

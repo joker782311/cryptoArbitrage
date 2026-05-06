@@ -1,4 +1,4 @@
-package handlers
+package websocket
 
 import (
 	"net/http"
@@ -41,7 +41,7 @@ func WebSocketHandler(c *gin.Context) {
 		send: make(chan []byte, 256),
 	}
 
-	client.hub.Register <- client
+	client.hub.register <- client
 	go client.WritePump()
 	go client.ReadPump()
 }
@@ -115,7 +115,7 @@ type Client struct {
 // ReadPump 读取客户端消息
 func (c *Client) ReadPump() {
 	defer func() {
-		c.hub.Unregister <- c
+		c.hub.unregister <- c
 		c.conn.Close()
 	}()
 

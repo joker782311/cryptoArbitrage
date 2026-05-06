@@ -37,8 +37,8 @@ func (m *Manager) loadFromDB() {
 	// 加载 API Key
 	var apiKeys []model.APIKey
 	database.DB.Where("is_enabled = ?", true).Find(&apiKeys)
-	for _, k := range apiKeys {
-		m.apiKeys[k.Exchange] = k
+	for i := range apiKeys {
+		m.apiKeys[apiKeys[i].Exchange] = &apiKeys[i]
 	}
 }
 

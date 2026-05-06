@@ -8,9 +8,10 @@ var Log *zap.SugaredLogger
 
 func Init() error {
 	var err error
-	Log, err = zap.NewDevelopment()
+	l, err := zap.NewDevelopment()
 	if err != nil {
 		return err
 	}
+	Log = l.Sugar()
 	return nil
 }

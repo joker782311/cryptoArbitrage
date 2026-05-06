@@ -1,5 +1,15 @@
 package exchange
 
+import (
+	"context"
+	"fmt"
+	"strconv"
+
+	"github.com/joker782311/cryptoArbitrage/internal/exchange/binance"
+	"github.com/joker782311/cryptoArbitrage/internal/exchange/bitget"
+	"github.com/joker782311/cryptoArbitrage/internal/exchange/okx"
+)
+
 // 币安适配器
 type BinanceAdapter struct {
 	client *binance.Client
@@ -11,13 +21,13 @@ func (a *BinanceAdapter) GetTicker(ctx context.Context, symbol string) (*Ticker,
 		return nil, err
 	}
 	return &Ticker{
-		Exchange:         "binance",
-		Symbol:           t.Symbol,
-		Price:            t.LastPrice,
-		Bid:              t.BidPrice,
-		Ask:              t.AskPrice,
-		Volume24h:        t.Volume,
-		Change24h:        t.PriceChangePercent,
+		Exchange:  "binance",
+		Symbol:    t.Symbol,
+		Price:     t.LastPrice,
+		Bid:       t.BidPrice,
+		Ask:       t.AskPrice,
+		Volume24h: t.Volume,
+		Change24h: t.PriceChangePercent,
 	}, nil
 }
 
@@ -29,13 +39,13 @@ func (a *BinanceAdapter) GetTickers(ctx context.Context) ([]Ticker, error) {
 	result := make([]Ticker, len(tickers))
 	for i, t := range tickers {
 		result[i] = Ticker{
-			Exchange:         "binance",
-			Symbol:           t.Symbol,
-			Price:            t.LastPrice,
-			Bid:              t.BidPrice,
-			Ask:              t.AskPrice,
-			Volume24h:        t.Volume,
-			Change24h:        t.PriceChangePercent,
+			Exchange:  "binance",
+			Symbol:    t.Symbol,
+			Price:     t.LastPrice,
+			Bid:       t.BidPrice,
+			Ask:       t.AskPrice,
+			Volume24h: t.Volume,
+			Change24h: t.PriceChangePercent,
 		}
 	}
 	return result, nil
@@ -46,11 +56,19 @@ func (a *BinanceAdapter) GetOrderBook(ctx context.Context, symbol string, limit 
 	if err != nil {
 		return nil, err
 	}
+	bids := make([]PriceLevel, len(ob.Bids))
+	asks := make([]PriceLevel, len(ob.Asks))
+	for i, b := range ob.Bids {
+		bids[i] = PriceLevel{Price: b.Price, Quantity: b.Quantity}
+	}
+	for i, a := range ob.Asks {
+		asks[i] = PriceLevel{Price: a.Price, Quantity: a.Quantity}
+	}
 	return &OrderBook{
 		Exchange: "binance",
 		Symbol:   symbol,
-		Bids:     ob.Bids,
-		Asks:     ob.Asks,
+		Bids:     bids,
+		Asks:     asks,
 	}, nil
 }
 
@@ -59,10 +77,11 @@ func (a *BinanceAdapter) GetFundingRate(ctx context.Context, symbol string) (*Fu
 	if err != nil {
 		return nil, err
 	}
+	f, _ := strconv.ParseFloat(rate.FundingRate, 64)
 	return &FundingRate{
 		Exchange:    "binance",
 		Symbol:      rate.Symbol,
-		FundingRate: parseFloat(rate.FundingRate),
+		FundingRate: f,
 		NextFunding: rate.FundingTime,
 	}, nil
 }
@@ -75,23 +94,23 @@ func (a *BinanceAdapter) PlaceOrder(ctx context.Context, symbol, side, orderType
 	return &Order{
 		Exchange:    "binance",
 		Symbol:      o.Symbol,
-		Side:        o.Side,
-		Type:        o.Type,
+		Side:        string(o.Side),
+		Type:        string(o.Type),
 		Price:       o.Price,
 		Quantity:    o.Quantity,
 		ExecutedQty: o.ExecutedQty,
-		Status:      o.Status,
+		Status:      string(o.Status),
 		OrderID:     fmt.Sprintf("%d", o.OrderID),
 	}, nil
 }
 
 func (a *BinanceAdapter) CancelOrder(ctx context.Context, symbol, orderID string) error {
-	oid := parseInt64(orderID)
+	oid, _ := strconv.ParseInt(orderID, 10, 64)
 	return a.client.CancelOrder(ctx, symbol, oid)
 }
 
 func (a *BinanceAdapter) GetOrder(ctx context.Context, symbol, orderID string) (*Order, error) {
-	oid := parseInt64(orderID)
+	oid, _ := strconv.ParseInt(orderID, 10, 64)
 	o, err := a.client.GetOrder(ctx, symbol, oid)
 	if err != nil {
 		return nil, err
@@ -99,12 +118,12 @@ func (a *BinanceAdapter) GetOrder(ctx context.Context, symbol, orderID string) (
 	return &Order{
 		Exchange:    "binance",
 		Symbol:      o.Symbol,
-		Side:        o.Side,
-		Type:        o.Type,
+		Side:        string(o.Side),
+		Type:        string(o.Type),
 		Price:       o.Price,
 		Quantity:    o.Quantity,
 		ExecutedQty: o.ExecutedQty,
-		Status:      o.Status,
+		Status:      string(o.Status),
 		OrderID:     fmt.Sprintf("%d", o.OrderID),
 	}, nil
 }
@@ -129,15 +148,15 @@ func (a *BinanceAdapter) GetPositions(ctx context.Context) ([]Position, error) {
 	}
 	result := make([]Position, 0)
 	for _, p := range positions {
-		if parseFloat(p.PositionAmt) != 0 {
+		if p.PositionAmt != 0 {
 			result = append(result, Position{
 				Exchange:     "binance",
 				Symbol:       p.Symbol,
 				Side:         p.PositionSide,
-				Quantity:     parseFloat(p.PositionAmt),
-				EntryPrice:   parseFloat(p.EntryPrice),
-				CurrentPrice: parseFloat(p.MarkPrice),
-				PNL:          parseFloat(p.UnRealizedPnL),
+				Quantity:     p.PositionAmt,
+				EntryPrice:   p.EntryPrice,
+				CurrentPrice: p.MarkPrice,
+				PNL:          p.UnRealizedPnL,
 			})
 		}
 	}
@@ -147,24 +166,32 @@ func (a *BinanceAdapter) GetPositions(ctx context.Context) ([]Position, error) {
 func (a *BinanceAdapter) SubscribeTicker(ctx context.Context, symbols []string, handler func(*Ticker)) error {
 	return a.client.SubscribeTicker(symbols, func(t *binance.Ticker) {
 		handler(&Ticker{
-			Exchange:         "binance",
-			Symbol:           t.Symbol,
-			Price:            t.LastPrice,
-			Bid:              t.BidPrice,
-			Ask:              t.AskPrice,
-			Volume24h:        t.Volume,
-			Change24h:        t.PriceChangePercent,
+			Exchange:  "binance",
+			Symbol:    t.Symbol,
+			Price:     t.LastPrice,
+			Bid:       t.BidPrice,
+			Ask:       t.AskPrice,
+			Volume24h: t.Volume,
+			Change24h: t.PriceChangePercent,
 		})
 	})
 }
 
 func (a *BinanceAdapter) SubscribeOrderBook(ctx context.Context, symbol string, limit int, handler func(*OrderBook)) error {
 	return a.client.SubscribeOrderBook(symbol, limit, func(ob *binance.OrderBook) {
+		bids := make([]PriceLevel, len(ob.Bids))
+		asks := make([]PriceLevel, len(ob.Asks))
+		for i, b := range ob.Bids {
+			bids[i] = PriceLevel{Price: b.Price, Quantity: b.Quantity}
+		}
+		for i, a := range ob.Asks {
+			asks[i] = PriceLevel{Price: a.Price, Quantity: a.Quantity}
+		}
 		handler(&OrderBook{
 			Exchange: "binance",
 			Symbol:   symbol,
-			Bids:     ob.Bids,
-			Asks:     ob.Asks,
+			Bids:     bids,
+			Asks:     asks,
 		})
 	})
 }
@@ -180,13 +207,13 @@ func (a *OKXAdapter) GetTicker(ctx context.Context, instID string) (*Ticker, err
 		return nil, err
 	}
 	return &Ticker{
-		Exchange:         "okx",
-		Symbol:           t.InstID,
-		Price:            parseFloat(t.LastPx),
-		Bid:              parseFloat(t.BidPx),
-		Ask:              parseFloat(t.AskPx),
-		Volume24h:        parseFloat(t.Vol24h),
-		Change24h:        parseFloat(t.ChangePercent24h),
+		Exchange:  "okx",
+		Symbol:    t.InstID,
+		Price:     parseFloat(t.LastPx),
+		Bid:       parseFloat(t.BidPx),
+		Ask:       parseFloat(t.AskPx),
+		Volume24h: parseFloat(t.Vol24h),
+		Change24h: parseFloat(t.ChangePercent24h),
 	}, nil
 }
 
@@ -198,13 +225,13 @@ func (a *OKXAdapter) GetTickers(ctx context.Context) ([]Ticker, error) {
 	result := make([]Ticker, len(tickers))
 	for i, t := range tickers {
 		result[i] = Ticker{
-			Exchange:         "okx",
-			Symbol:           t.InstID,
-			Price:            parseFloat(t.LastPx),
-			Bid:              parseFloat(t.BidPx),
-			Ask:              parseFloat(t.AskPx),
-			Volume24h:        parseFloat(t.Vol24h),
-			Change24h:        parseFloat(t.ChangePercent24h),
+			Exchange:  "okx",
+			Symbol:    t.InstID,
+			Price:     parseFloat(t.LastPx),
+			Bid:       parseFloat(t.BidPx),
+			Ask:       parseFloat(t.AskPx),
+			Volume24h: parseFloat(t.Vol24h),
+			Change24h: parseFloat(t.ChangePercent24h),
 		}
 	}
 	return result, nil
@@ -350,13 +377,13 @@ func (a *BitgetAdapter) GetTicker(ctx context.Context, symbol string) (*Ticker, 
 		return nil, err
 	}
 	return &Ticker{
-		Exchange:         "bitget",
-		Symbol:           t.Symbol,
-		Price:            parseFloat(t.LastPr),
-		Bid:              parseFloat(t.BidPr),
-		Ask:              parseFloat(t.AskPr),
-		Volume24h:        parseFloat(t.Vol24h),
-		Change24h:        parseFloat(t.ChangePct),
+		Exchange:  "bitget",
+		Symbol:    t.Symbol,
+		Price:     parseFloat(t.LastPr),
+		Bid:       parseFloat(t.BidPr),
+		Ask:       parseFloat(t.AskPr),
+		Volume24h: parseFloat(t.Vol24h),
+		Change24h: parseFloat(t.ChangePct),
 	}, nil
 }
 
@@ -368,13 +395,13 @@ func (a *BitgetAdapter) GetTickers(ctx context.Context) ([]Ticker, error) {
 	result := make([]Ticker, len(tickers))
 	for i, t := range tickers {
 		result[i] = Ticker{
-			Exchange:         "bitget",
-			Symbol:           t.Symbol,
-			Price:            parseFloat(t.LastPr),
-			Bid:              parseFloat(t.BidPr),
-			Ask:              parseFloat(t.AskPr),
-			Volume24h:        parseFloat(t.Vol24h),
-			Change24h:        parseFloat(t.ChangePct),
+			Exchange:  "bitget",
+			Symbol:    t.Symbol,
+			Price:     parseFloat(t.LastPr),
+			Bid:       parseFloat(t.BidPr),
+			Ask:       parseFloat(t.AskPr),
+			Volume24h: parseFloat(t.Vol24h),
+			Change24h: parseFloat(t.ChangePct),
 		}
 	}
 	return result, nil
@@ -459,7 +486,6 @@ func (a *BitgetAdapter) GetBalance(ctx context.Context, asset string) (*Balance,
 }
 
 func (a *BitgetAdapter) GetPositions(ctx context.Context) ([]Position, error) {
-	// TODO: 实现获取合约仓位
 	return []Position{}, nil
 }
 
@@ -468,7 +494,7 @@ func (a *BitgetAdapter) SubscribeTicker(ctx context.Context, symbols []string, h
 		handler(&Ticker{
 			Exchange: "bitget",
 			Symbol:   t.Symbol,
-			Price:    parseFloat(t.Last),
+			Price:    parseFloat(t.LastPr),
 			Bid:      parseFloat(t.BidPr),
 			Ask:      parseFloat(t.AskPr),
 		})
@@ -504,11 +530,5 @@ func parseFloat(s string) float64 {
 	}
 	var v float64
 	fmt.Sscanf(s, "%f", &v)
-	return v
-}
-
-func parseInt64(s string) int64 {
-	var v int64
-	fmt.Sscanf(s, "%d", &v)
 	return v
 }

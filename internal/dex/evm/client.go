@@ -96,7 +96,7 @@ func (c *Client) GetTokenBalance(ctx context.Context, tokenAddress, holderAddres
 
 	// ERC20 balanceOf 方法签名
 	data := common.Hex2Bytes("70a08231")
-	data = append(data, common.HexToAddress(holderAddress).Bytes()...)
+	data = append(data, holderAddr.Bytes()...)
 
 	msg := ethereum.CallMsg{
 		To:   &tokenAddr,

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"sync"
-	"time"
 
 	"github.com/joker782311/cryptoArbitrage/internal/database"
 	"github.com/joker782311/cryptoArbitrage/internal/exchange"
@@ -17,7 +16,7 @@ type Manager struct {
 	mu        sync.RWMutex
 	exchanges map[string]exchange.Exchange
 	orderMap  map[string]*model.Order // orderID -> Order
-	pending   map[string]*strategy.Lg // 待执行的交易腿
+	pending   map[string]*strategy.Leg // 待执行的交易腿
 }
 
 // NewManager 创建订单管理器

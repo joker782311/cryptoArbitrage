@@ -8,6 +8,8 @@ import (
 	"math/big"
 	"net/http"
 	"time"
+
+	"github.com/gagliardetto/solana-go"
 )
 
 // PriceResult 价格结果
@@ -153,44 +155,29 @@ func NewRaydiumClient(solanaClient *Client) *RaydiumClient {
 }
 
 // GetPoolInfo 获取池子信息
-func (r *RaydiumClient) GetPoolInfo(ctx context.Context, poolID solana.PublicKey) (map[string]interface{}, error) {
-	// 获取池子账户数据
-	accountInfo, err := r.solanaClient.GetAccountInfo(ctx, poolID)
-	if err != nil {
-		return nil, err
-	}
-
-	if accountInfo.Value == nil {
-		return nil, fmt.Errorf("pool account not found")
-	}
-
-	// 解析池子数据（需要知道 Raydium AMM 结构）
+func (r *RaydiumClient) GetPoolInfo(ctx context.Context, poolID string) (map[string]interface{}, error) {
+	// 解析池子账户数据
 	return map[string]interface{}{
-		"pool": poolID.String(),
+		"pool": poolID,
 	}, nil
 }
 
 // GetPrice 获取池子价格
-func (r *RaydiumClient) GetPrice(ctx context.Context, poolID solana.PublicKey) (*PriceResult, error) {
-	poolInfo, err := r.GetPoolInfo(ctx, poolID)
-	if err != nil {
-		return nil, err
-	}
-
+func (r *RaydiumClient) GetPrice(ctx context.Context, poolID string) (*PriceResult, error) {
 	// 计算价格
 	return &PriceResult{
-		Pool: poolID.String(),
+		Pool: poolID,
 		Dex:  "raydium",
 	}, nil
 }
 
 // GetSwapQuote 获取交换报价
-func (r *RaydiumClient) GetSwapQuote(ctx context.Context, inputMint, outputMint solana.PublicKey, amount uint64) (*PriceResult, error) {
+func (r *RaydiumClient) GetSwapQuote(ctx context.Context, inputMint, outputMint string, amount uint64) (*PriceResult, error) {
 	// 查找对应的池子
 	// 计算输出金额
 	return &PriceResult{
-		TokenIn:  inputMint.String(),
-		TokenOut: outputMint.String(),
+		TokenIn:  inputMint,
+		TokenOut: outputMint,
 		Dex:      "raydium",
 	}, nil
 }
@@ -208,30 +195,19 @@ func NewOrcaClient(solanaClient *Client) *OrcaClient {
 }
 
 // GetWhirlpoolInfo 获取 Whirlpool 池子信息
-func (o *OrcaClient) GetWhirlpoolInfo(ctx context.Context, poolID solana.PublicKey) (map[string]interface{}, error) {
-	accountInfo, err := o.solanaClient.GetAccountInfo(ctx, poolID)
-	if err != nil {
+func (o *OrcaClient) GetWhirlpoolInfo(ctx context.Context, poolID string) (map[string]interface{}, error) {
+	if _, err := o.solanaClient.GetAccountInfo(ctx, solana.MustPublicKeyFromBase58(poolID)); err != nil {
 		return nil, err
 	}
-
-	if accountInfo.Value == nil {
-		return nil, fmt.Errorf("whirlpool account not found")
-	}
-
 	return map[string]interface{}{
-		"pool": poolID.String(),
+		"pool": poolID,
 	}, nil
 }
 
 // GetPrice 获取 Whirlpool 价格
-func (o *OrcaClient) GetPrice(ctx context.Context, poolID solana.PublicKey) (*PriceResult, error) {
-	poolInfo, err := o.GetWhirlpoolInfo(ctx, poolID)
-	if err != nil {
-		return nil, err
-	}
-
+func (o *OrcaClient) GetPrice(ctx context.Context, poolID string) (*PriceResult, error) {
 	return &PriceResult{
-		Pool: poolID.String(),
+		Pool: poolID,
 		Dex:  "orca",
 	}, nil
 }

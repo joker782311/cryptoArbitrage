@@ -42,11 +42,14 @@ func (f *ExchangeFactory) GetAll() map[string]Exchange {
 func CreateExchange(name, apiKey, secretKey, passphrase string) (Exchange, error) {
 	switch name {
 	case "binance", "binance_futures":
-		return binance.NewClient(apiKey, secretKey), nil
+		client := binance.NewClient(apiKey, secretKey)
+		return &BinanceAdapter{client: client}, nil
 	case "okx":
-		return okx.NewClient(apiKey, secretKey, passphrase), nil
+		client := okx.NewClient(apiKey, secretKey, passphrase)
+		return &OKXAdapter{client: client}, nil
 	case "bitget":
-		return bitget.NewClient(apiKey, secretKey, passphrase), nil
+		client := bitget.NewClient(apiKey, secretKey, passphrase)
+		return &BitgetAdapter{client: client}, nil
 	default:
 		return nil, fmt.Errorf("unsupported exchange: %s", name)
 	}
