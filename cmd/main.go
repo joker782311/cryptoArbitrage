@@ -7,11 +7,14 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/joker782311/cryptoArbitrage/internal/api"
+	"github.com/joker782311/cryptoArbitrage/internal/api/handlers"
 	"github.com/joker782311/cryptoArbitrage/internal/config"
 	"github.com/joker782311/cryptoArbitrage/internal/database"
 	"github.com/joker782311/cryptoArbitrage/internal/exchange"
+	"github.com/joker782311/cryptoArbitrage/internal/model"
 	"github.com/joker782311/cryptoArbitrage/internal/service/alert"
 	"github.com/joker782311/cryptoArbitrage/internal/service/order"
 	"github.com/joker782311/cryptoArbitrage/internal/service/risk"
@@ -51,13 +54,20 @@ func main() {
 	// 初始化交易所
 	exchangeFactory := exchange.NewExchangeFactory()
 
-	// 从配置加载交易所 API Key
-	_ = exchangeFactory // Placeholder for future use
+	// 创建交易所实例（不需要 API Key 也可以获取行情）
+	exchanges := make(map[string]exchange.Exchange)
 	for _, exName := range exchange.SupportedExchanges() {
-		_ = exName // Placeholder
+		ex, err := exchange.CreateExchange(exName, "", "", "")
+		if err != nil {
+			logger.Log.Warnf("Failed to create exchange %s: %v", exName, err)
+			continue
+		}
+		exchanges[exName] = ex
+		exchangeFactory.Register(exName, ex)
 	}
 
-	exchanges := exchangeFactory.GetAll()
+	// 初始化 handlers（传入 exchangeFactory）
+	handlers.InitHandlers(exchangeFactory)
 
 	// 初始化策略引擎
 	strategyEngine := strategy.NewEngine(exchanges)
@@ -102,6 +112,9 @@ func main() {
 	strategyEngine.AddStrategy(triangularStrategy)
 
 	logger.Log.Info("Strategies initialized")
+
+	// 插入测试数据（如果数据库为空）
+	initSeedData()
 
 	// 初始化订单管理器
 	_ = order.NewManager(exchanges)
@@ -158,4 +171,130 @@ func main() {
 	strategyEngine.Stop()
 
 	logger.Log.Info("Server stopped")
+}
+
+// initSeedData 插入测试数据
+func initSeedData() {
+	now := time.Now()
+
+	// 插入策略数据
+	strategies := []model.Strategy{
+		{
+			Name:          "cross_exchange",
+			IsEnabled:     true,
+			AutoExecute:   true,
+			MinProfitRate: 0.5,
+			MaxPosition:   10000,
+			Config:        `{"exchanges": ["binance", "okx"], "symbols": ["BTCUSDT", "ETHUSDT"]}`,
+		},
+		{
+			Name:          "funding_rate",
+			IsEnabled:     true,
+			AutoExecute:   false,
+			MinProfitRate: 1.0,
+			MaxPosition:   20000,
+			Config:        `{"exchanges": ["binance", "okx"], "symbols": ["BTCUSDT", "ETHUSDT"]}`,
+		},
+		{
+			Name:          "spot_future",
+			IsEnabled:     true,
+			AutoExecute:   true,
+			MinProfitRate: 0.3,
+			MaxPosition:   15000,
+			Config:        `{"exchange": "binance", "symbols": ["BTCUSDT", "ETHUSDT"]}`,
+		},
+		{
+			Name:          "triangular",
+			IsEnabled:     false,
+			AutoExecute:   false,
+			MinProfitRate: 0.2,
+			MaxPosition:   5000,
+			Config:        `{"exchange": "binance", "pairs": [{"base": "BTC", "quote": "USDT"}, {"base": "ETH", "quote": "USDT"}]}`,
+		},
+	}
+
+	for _, s := range strategies {
+		var existing model.Strategy
+		if err := database.DB.Where("name = ?", s.Name).First(&existing).Error; err != nil {
+			database.DB.Create(&s)
+			logger.Log.Infof("Inserted strategy: %s", s.Name)
+		}
+	}
+
+	// 插入订单数据
+	orders := []model.Order{
+		{
+			StrategyID:  1,
+			Exchange:    "binance",
+			Symbol:      "BTCUSDT",
+			Side:        "buy",
+			Type:        "market",
+			Price:       67500,
+			Quantity:    0.1,
+			ExecutedQty: 0.1,
+			Status:      "filled",
+			OrderID:     "BNB001",
+			CreatedAt:   now.Add(-2 * time.Hour),
+		},
+		{
+			StrategyID:  1,
+			Exchange:    "okx",
+			Symbol:      "BTCUSDT",
+			Side:        "sell",
+			Type:        "market",
+			Price:       67520,
+			Quantity:    0.1,
+			ExecutedQty: 0.1,
+			Status:      "filled",
+			OrderID:     "OKX001",
+			CreatedAt:   now.Add(-2*time.Hour + time.Minute),
+		},
+		{
+			StrategyID:  2,
+			Exchange:    "binance",
+			Symbol:      "ETHUSDT",
+			Side:        "buy",
+			Type:        "market",
+			Price:       3450,
+			Quantity:    1.0,
+			ExecutedQty: 1.0,
+			Status:      "filled",
+			OrderID:     "BNB002",
+			CreatedAt:   now.Add(-1 * time.Hour),
+		},
+		{
+			StrategyID:  2,
+			Exchange:    "okx",
+			Symbol:      "ETHUSDT",
+			Side:        "sell",
+			Type:        "market",
+			Price:       3452,
+			Quantity:    1.0,
+			ExecutedQty: 1.0,
+			Status:      "filled",
+			OrderID:     "OKX002",
+			CreatedAt:   now.Add(-1*time.Hour + time.Minute*30),
+		},
+		{
+			StrategyID:  3,
+			Exchange:    "binance",
+			Symbol:      "BTCUSDT",
+			Side:        "buy",
+			Type:        "limit",
+			Price:       67000,
+			Quantity:    0.05,
+			ExecutedQty: 0,
+			Status:      "pending",
+			OrderID:     "BNB003",
+			CreatedAt:   now.Add(-30 * time.Minute),
+		},
+	}
+
+	for _, o := range orders {
+		var existing model.Order
+		if err := database.DB.Where("order_id = ?", o.OrderID).First(&existing).Error; err != nil {
+			database.DB.Create(&o)
+			logger.Log.Infof("Inserted order: %s - %s %s", o.OrderID, o.Exchange, o.Symbol)
+		}
+	}
 }

@@ -16,64 +16,28 @@ export interface Ticker {
 }
 
 export const useTickerStore = defineStore('ticker', () => {
-  const tickers = ref<Ticker[]>([])
+  const tickers = ref<Ticker[]>([])  // 初始值为空数组
   const loading = ref(false)
   const wsConnected = ref(false)
 
   async function fetchTickers() {
     loading.value = true
     try {
-      // TODO: 替换为实际 API
-      tickers.value = [
-        {
-          exchange: 'binance',
-          symbol: 'BTCUSDT',
-          price: 67500,
-          bid: 67499,
-          ask: 67501,
-          volume24h: 125000000,
-          change24h: 2.5,
-          high24h: 68000,
-          low24h: 66000,
-          timestamp: Date.now(),
-        },
-        {
-          exchange: 'okx',
-          symbol: 'BTCUSDT',
-          price: 67520,
-          bid: 67518,
-          ask: 67522,
-          volume24h: 98000000,
-          change24h: 2.6,
-          high24h: 68100,
-          low24h: 66100,
-          timestamp: Date.now(),
-        },
-        {
-          exchange: 'bitget',
-          symbol: 'BTCUSDT',
-          price: 67480,
-          bid: 67478,
-          ask: 67482,
-          volume24h: 45000000,
-          change24h: 2.3,
-          high24h: 67900,
-          low24h: 65900,
-          timestamp: Date.now(),
-        },
-        {
-          exchange: 'binance',
-          symbol: 'ETHUSDT',
-          price: 3450,
-          bid: 3449,
-          ask: 3451,
-          volume24h: 85000000,
-          change24h: 3.2,
-          high24h: 3500,
-          low24h: 3350,
-          timestamp: Date.now(),
-        },
-      ]
+      const response = await api.get('/tickers')
+      console.log('Tickers response:', response)
+      // axios interceptor 已返回 response.data
+      // API 返回格式：{ tickers: [...] }
+      if (response && response.tickers && Array.isArray(response.tickers)) {
+        tickers.value = response.tickers
+        console.log('Tickers loaded:', tickers.value.length)
+      } else if (response && Array.isArray(response)) {
+        tickers.value = response
+        console.log('Tickers loaded (direct):', tickers.value.length)
+      } else {
+        console.warn('No tickers data received, response type:', typeof response)
+      }
+    } catch (error) {
+      console.error('Failed to fetch tickers:', error)
     } finally {
       loading.value = false
     }

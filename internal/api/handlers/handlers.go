@@ -2,9 +2,12 @@ package handlers
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/joker782311/cryptoArbitrage/internal/database"
 	"github.com/joker782311/cryptoArbitrage/internal/exchange"
+	"github.com/joker782311/cryptoArbitrage/internal/model"
 )
 
 var exchangeFactory *exchange.ExchangeFactory
@@ -16,9 +19,59 @@ func InitHandlers(factory *exchange.ExchangeFactory) {
 
 // GetTickers 获取所有行情
 func GetTickers(c *gin.Context) {
-	// TODO: 从缓存或策略引擎获取
+	// TODO: 从真实交易所获取数据需要网络代理
+	// 目前返回 mock 数据用于前端展示
 	c.JSON(http.StatusOK, gin.H{
-		"tickers": []interface{}{},
+		"tickers": []map[string]interface{}{
+			{
+				"exchange":  "binance",
+				"symbol":    "BTCUSDT",
+				"price":     67500.00,
+				"bid":       67499.50,
+				"ask":       67500.50,
+				"volume24h": 1234567890.00,
+				"change24h": 2.35,
+				"high24h":   68000.00,
+				"low24h":    66500.00,
+				"timestamp": time.Now().UnixMilli(),
+			},
+			{
+				"exchange":  "okx",
+				"symbol":    "BTCUSDT",
+				"price":     67520.00,
+				"bid":       67519.50,
+				"ask":       67520.50,
+				"volume24h": 987654321.00,
+				"change24h": 2.40,
+				"high24h":   68100.00,
+				"low24h":    66600.00,
+				"timestamp": time.Now().UnixMilli(),
+			},
+			{
+				"exchange":  "binance",
+				"symbol":    "ETHUSDT",
+				"price":     3450.00,
+				"bid":       3449.50,
+				"ask":       3450.50,
+				"volume24h": 567890123.00,
+				"change24h": 1.85,
+				"high24h":   3500.00,
+				"low24h":    3380.00,
+				"timestamp": time.Now().UnixMilli(),
+			},
+			{
+				"exchange":  "okx",
+				"symbol":    "ETHUSDT",
+				"price":     3452.00,
+				"bid":       3451.50,
+				"ask":       3452.50,
+				"volume24h": 432109876.00,
+				"change24h": 1.90,
+				"high24h":   3510.00,
+				"low24h":    3390.00,
+				"timestamp": time.Now().UnixMilli(),
+			},
+		},
 	})
 }
 
@@ -103,9 +156,15 @@ func SetAutoExecute(c *gin.Context) {
 
 // ListOrders 获取订单列表
 func ListOrders(c *gin.Context) {
+	var orders []model.Order
+	if err := database.DB.Order("created_at DESC").Limit(100).Find(&orders).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
 	c.JSON(http.StatusOK, gin.H{
-		"orders": []interface{}{},
-		"total":  0,
+		"orders": orders,
+		"total":  len(orders),
 	})
 }
 

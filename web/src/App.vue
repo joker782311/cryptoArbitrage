@@ -46,6 +46,12 @@ const menuItems = [
   box-sizing: border-box;
 }
 
+html, body {
+  width: 100%;
+  height: 100%;
+  overflow-x: hidden;
+}
+
 body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
   background: #f5f7fa;
@@ -53,7 +59,9 @@ body {
 
 .app {
   display: flex;
-  min-height: 100vh;
+  width: 100%;
+  height: 100vh;
+  overflow: hidden;
 }
 
 .sidebar {
@@ -63,6 +71,7 @@ body {
   position: fixed;
   height: 100vh;
   overflow-y: auto;
+  z-index: 1000;
 }
 
 .logo {
@@ -108,8 +117,10 @@ body {
 
 .main-content {
   margin-left: 220px;
-  flex: 1;
-  padding: 20px;
-  min-height: 100vh;
+  width: calc(100vw - 220px);
+  height: 100vh;
+  overflow-y: auto;
+  background: #f5f7fa;
+  padding: 0;
 }
 </style>
