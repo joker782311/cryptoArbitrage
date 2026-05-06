@@ -1,10 +1,23 @@
-# 部署指南
+# Crypto Arbitrage Platform 部署指南
+
+## 目录
+
+1. [环境要求](#环境要求)
+2. [快速开始](#快速开始)
+3. [生产环境部署](#生产环境部署)
+4. [监控和告警](#监控和告警)
+5. [备份和恢复](#备份和恢复)
+6. [故障排查](#故障排查)
 
 ## 环境要求
 
-- Docker 20+
-- Docker Compose 2+
-- 可用内存：至少 2GB
+| 组件 | 最低要求 | 推荐配置 |
+|------|---------|---------|
+| CPU | 2 核心 | 4 核心 |
+| 内存 | 4GB | 8GB |
+| 磁盘 | 20GB SSD | 50GB+ SSD |
+| Docker | 20.10+ | 24.0+ |
+| Docker Compose | 2.0+ | 2.20+ |
 
 ## 快速开始
 
@@ -18,172 +31,143 @@ cd cryptoArbitrage
 ### 2. 配置环境变量
 
 ```bash
-cp .env.example .env
-```
-
-编辑 `.env` 文件，配置以下内容：
-
-```bash
-# 服务配置
+cat > .env << EOF
+DB_PASSWORD=YourSecurePassword123!
+REDIS_PASSWORD=YourRedisPassword456!
 SERVER_PORT=8080
-SERVER_MODE=release  # 生产环境使用 release
-
-# 数据库配置
-DB_HOST=mysql
-DB_PORT=3306
-DB_USER=root
-DB_PASSWORD=your_secure_password  # 修改为强密码
-DB_NAME=crypto_arbitrage
-
-# Redis 配置
-REDIS_HOST=redis
-REDIS_PORT=6379
-REDIS_PASSWORD=  # 生产环境建议设置密码
+SERVER_MODE=release
+EOF
 ```
 
 ### 3. 启动服务
 
 ```bash
 docker-compose up -d
-```
-
-### 4. 查看运行状态
-
-```bash
-# 查看容器状态
 docker-compose ps
-
-# 查看应用日志
 docker-compose logs -f app
-
-# 查看数据库日志
-docker-compose logs -f mysql
 ```
 
-### 5. 停止服务
+### 4. 验证部署
 
 ```bash
-docker-compose down
+curl http://localhost:8080/health
 ```
+
+### 5. 访问应用
+
+- 前端：http://localhost
+- API: http://localhost:8080/api/v1
 
 ## 生产环境部署
 
-### 前置准备
+### 服务器初始化
 
-1. **域名和 SSL 证书**
+```bash
+# 安装 Docker
+curl -fsSL https://get.docker.com | sudo sh
+sudo usermod -aG docker $USER
 
-   如果使用 HTTPS，需要配置反向代理（如 Nginx）
+# 安装 Docker Compose
+sudo apt install docker-compose-plugin -y
 
-2. **数据库备份**
-
-   配置 MySQL 定时备份：
-
-   ```bash
-   # 备份脚本
-   mysqldump -h mysql -u root -p crypto_arbitrage > backup_$(date +%Y%m%d).sql
-   ```
-
-3. **密钥管理**
-
-   交易所 API Key 使用加密存储，不要明文保存在环境变量中
-
-### Docker Compose 生产配置
-
-创建 `docker-compose.prod.yml`：
-
-```yaml
-version: '3.8'
-
-services:
-  app:
-    image: your-registry/crypto-arbitrage:latest
-    ports:
-      - "8080:8080"
-    environment:
-      - SERVER_MODE=release
-      - DB_HOST=mysql
-      - DB_PASSWORD=${DB_PASSWORD}
-    restart: unless-stopped
-    depends_on:
-      - mysql
-      - redis
-
-  mysql:
-    image: mysql:8.0
-    environment:
-      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
-      MYSQL_DATABASE: crypto_arbitrage
-    volumes:
-      - mysql_data:/var/lib/mysql
-      - ./mysql/conf.d:/etc/mysql/conf.d
-    restart: unless-stopped
-
-  redis:
-    image: redis:7-alpine
-    command: redis-server --requirepass ${REDIS_PASSWORD}
-    volumes:
-      - redis_data:/data
-    restart: unless-stopped
-
-volumes:
-  mysql_data:
-  redis_data:
+# 配置防火墙
+sudo ufw allow 22/tcp
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+sudo ufw enable
 ```
 
-### 监控和告警
+### SSL/HTTPS 配置
 
-1. **应用监控**
-   - 集成 Prometheus + Grafana
-   - 监控指标：请求延迟、错误率、CPU/内存使用
+```bash
+sudo apt install certbot python3-certbot-nginx -y
+sudo certbot --nginx -d your-domain.com
+```
 
-2. **日志收集**
-   - 使用 ELK Stack 或 Loki
-   - 集中管理应用日志
+## 监控和告警
 
-3. **告警配置**
-   - 在系统中配置 Telegram/Slack 告警
-   - 设置关键指标阈值
+### Prometheus 配置
+
+```yaml
+# configs/prometheus.yml
+global:
+  scrape_interval: 15s
+scrape_configs:
+  - job_name: 'arbitrage'
+    static_configs:
+      - targets: ['app:8080']
+```
+
+### Grafana Dashboard
+
+导入 Dashboard ID: `10826` (Go 应用监控)
+
+## 备份和恢复
+
+### 数据库备份
+
+```bash
+docker-compose exec -T mysql mysqldump -u root -p${DB_PASSWORD} crypto_arbitrage > backup_$(date +%Y%m%d).sql
+```
+
+### 数据恢复
+
+```bash
+cat backup_20240101.sql | docker-compose exec -T mysql mysql -u root -p${DB_PASSWORD} crypto_arbitrage
+```
 
 ## 故障排查
 
 ### 容器无法启动
 
 ```bash
-# 查看详细日志
 docker-compose logs app
-
-# 检查配置
-docker-compose config
+docker stats
+docker-compose restart app
 ```
 
-### 数据库连接失败
+### 数据库连接超时
 
 ```bash
-# 测试数据库连接
 docker-compose exec app ping mysql
-
-# 检查 MySQL 状态
 docker-compose exec mysql mysqladmin status -u root -p
 ```
 
-### 数据持久化
+### 内存不足
 
-确保 volume 正确配置：
-
-```bash
-# 查看 volume
-docker volume ls
-
-# 检查数据目录
-docker-compose exec mysql ls /var/lib/mysql
+```yaml
+# docker-compose.yml 中添加:
+services:
+  app:
+    deploy:
+      resources:
+        limits:
+          memory: 2G
 ```
 
-## 更新部署
+### 端口冲突
 
 ```bash
-# 拉取最新代码
-git pull
+sudo lsof -i :8080
+# 修改 .env: SERVER_PORT=8081
+```
 
-# 重新构建并重启
-docker-compose up -d --build
+## 安全加固
+
+1. 修改默认密码
+2. 配置 API Key IP 白名单
+3. 定期轮换密钥
+4. 限制数据库访问
+
+## 性能调优
+
+```bash
+# MySQL 优化 configs/mysql.cnf
+[mysqld]
+max_connections = 500
+innodb_buffer_pool_size = 1G
+
+# Redis 优化 configs/redis.conf
+maxmemory 2gb
+maxmemory-policy allkeys-lru
 ```
