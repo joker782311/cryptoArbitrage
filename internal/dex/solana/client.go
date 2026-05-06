@@ -79,8 +79,8 @@ func (c *Client) GetAccountInfo(ctx context.Context, account solana.PublicKey) (
 // GetTransaction 获取交易详情
 func (c *Client) GetTransaction(ctx context.Context, signature solana.Signature) (*rpc.GetTransactionResult, error) {
 	tx, err := c.RPC.GetTransaction(ctx, signature, &rpc.GetTransactionOpts{
-		Encoding:                   solana.EncodingBase64,
-		Commitment:                 rpc.CommitmentFinalized,
+		Encoding:                       solana.EncodingBase64,
+		Commitment:                     rpc.CommitmentFinalized,
 		MaxSupportedTransactionVersion: uint64Ptr(0),
 	})
 	if err != nil {

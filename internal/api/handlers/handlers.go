@@ -40,20 +40,20 @@ func ListStrategies(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"strategies": []map[string]interface{}{
 			{
-				"name":          "cross_exchange",
-				"display_name":  "跨交易所套利",
-				"is_enabled":    true,
-				"auto_execute":  true,
-				"min_profit":    0.5,
-				"max_position":  10000,
+				"name":         "cross_exchange",
+				"display_name": "跨交易所套利",
+				"is_enabled":   true,
+				"auto_execute": true,
+				"min_profit":   0.5,
+				"max_position": 10000,
 			},
 			{
-				"name":          "funding_rate",
-				"display_name":  "资金费率套利",
-				"is_enabled":    true,
-				"auto_execute":  false,
-				"min_profit":    1.0,
-				"max_position":  20000,
+				"name":         "funding_rate",
+				"display_name": "资金费率套利",
+				"is_enabled":   true,
+				"auto_execute": false,
+				"min_profit":   1.0,
+				"max_position": 20000,
 			},
 		},
 	})
@@ -139,20 +139,20 @@ func CancelOrder(c *gin.Context) {
 	exchangeName := c.Param("exchange")
 	orderID := c.Param("id")
 	c.JSON(http.StatusOK, gin.H{
-		"status":    "ok",
-		"exchange":  exchangeName,
-		"order_id":  orderID,
+		"status":   "ok",
+		"exchange": exchangeName,
+		"order_id": orderID,
 	})
 }
 
 // GetOrderStats 获取订单统计
 func GetOrderStats(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
-		"total_orders":   0,
-		"pending":        0,
-		"filled":         0,
-		"total_volume":   0,
-		"total_profit":   0,
+		"total_orders": 0,
+		"pending":      0,
+		"filled":       0,
+		"total_volume": 0,
+		"total_profit": 0,
 	})
 }
 
@@ -204,11 +204,11 @@ func MarkAlertsRead(c *gin.Context) {
 // GetAlertStats 获取告警统计
 func GetAlertStats(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
-		"total":       0,
-		"unread":      0,
-		"today":       0,
-		"by_type":     map[string]int{},
-		"by_level":    map[string]int{},
+		"total":    0,
+		"unread":   0,
+		"today":    0,
+		"by_type":  map[string]int{},
+		"by_level": map[string]int{},
 	})
 }
 
@@ -280,10 +280,10 @@ func DeleteAlertConfig(c *gin.Context) {
 // GetRiskStats 获取风控统计
 func GetRiskStats(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
-		"total_position":      0,
-		"daily_pnl":           0,
+		"total_position":       0,
+		"daily_pnl":            0,
 		"position_utilization": 0,
-		"remaining_limit":     100000,
+		"remaining_limit":      100000,
 	})
 }
 

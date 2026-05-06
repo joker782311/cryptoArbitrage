@@ -149,13 +149,13 @@ func NewUniswapV3Router(client *Client) *UniswapV3Router {
 
 // ExactInputSingleParams V3 精确输入参数
 type ExactInputSingleParams struct {
-	TokenIn       common.Address
-	TokenOut      common.Address
-	Fee           uint32
-	Recipient     common.Address
-	Deadline      *uint256.Int
-	AmountIn      *uint256.Int
-	AmountOutMinimum *uint256.Int
+	TokenIn           common.Address
+	TokenOut          common.Address
+	Fee               uint32
+	Recipient         common.Address
+	Deadline          *uint256.Int
+	AmountIn          *uint256.Int
+	AmountOutMinimum  *uint256.Int
 	SqrtPriceLimitX96 *uint256.Int
 }
 

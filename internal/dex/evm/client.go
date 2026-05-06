@@ -26,10 +26,10 @@ const (
 
 // ChainInfo 链信息
 type ChainInfo struct {
-	ChainID   ChainID
-	Name      string
-	RPCURL    string
-	Explorer  string
+	ChainID     ChainID
+	Name        string
+	RPCURL      string
+	Explorer    string
 	NativeToken string
 }
 

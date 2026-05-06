@@ -9,10 +9,10 @@ import (
 
 // CurvePool Curve 池子
 type CurvePool struct {
-	client     *Client
-	address    common.Address
-	coins      []string
-	coinCount  int
+	client    *Client
+	address   common.Address
+	coins     []string
+	coinCount int
 }
 
 // Curve Factory 地址

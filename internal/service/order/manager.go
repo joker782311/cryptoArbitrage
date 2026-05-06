@@ -15,7 +15,7 @@ import (
 type Manager struct {
 	mu        sync.RWMutex
 	exchanges map[string]exchange.Exchange
-	orderMap  map[string]*model.Order // orderID -> Order
+	orderMap  map[string]*model.Order  // orderID -> Order
 	pending   map[string]*strategy.Leg // 待执行的交易腿
 }
 
@@ -224,7 +224,7 @@ func (m *Manager) GetStats() (*Stats, error) {
 	return &Stats{
 		TotalOrders:   totalOrders,
 		PendingOrders: pendingOrders,
-		FilledOrders: filledOrders,
+		FilledOrders:  filledOrders,
 		TotalVolume:   totalVolume,
 	}, nil
 }

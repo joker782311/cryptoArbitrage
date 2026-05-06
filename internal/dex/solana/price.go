@@ -14,30 +14,30 @@ import (
 
 // PriceResult 价格结果
 type PriceResult struct {
-	TokenIn   string  `json:"token_in"`
-	TokenOut  string  `json:"token_out"`
-	Price     float64 `json:"price"`
-	Pool      string  `json:"pool"`
-	Dex       string  `json:"dex"`
-	Slippage  float64 `json:"slippage"`
+	TokenIn  string  `json:"token_in"`
+	TokenOut string  `json:"token_out"`
+	Price    float64 `json:"price"`
+	Pool     string  `json:"pool"`
+	Dex      string  `json:"dex"`
+	Slippage float64 `json:"slippage"`
 }
 
 // JupiterQuoteRequest Jupiter 报价请求
 type JupiterQuoteRequest struct {
-	InputMint  string `json:"inputMint"`
-	OutputMint string `json:"outputMint"`
-	Amount     uint64 `json:"amount"`
+	InputMint   string `json:"inputMint"`
+	OutputMint  string `json:"outputMint"`
+	Amount      uint64 `json:"amount"`
 	SlippageBps uint16 `json:"slippageBps"`
 }
 
 // JupiterQuoteResponse Jupiter 报价响应
 type JupiterQuoteResponse struct {
-	InputMint      string `json:"inputMint"`
-	InAmount       string `json:"inAmount"`
-	OutputMint     string `json:"outputMint"`
-	OutAmount      string `json:"outAmount"`
-	PriceImpactPct string `json:"priceImpactPct"`
-	SlippageBps    uint16 `json:"slippageBps"`
+	InputMint      string      `json:"inputMint"`
+	InAmount       string      `json:"inAmount"`
+	OutputMint     string      `json:"outputMint"`
+	OutAmount      string      `json:"outAmount"`
+	PriceImpactPct string      `json:"priceImpactPct"`
+	SlippageBps    uint16      `json:"slippageBps"`
 	RoutePlan      []RoutePlan `json:"routePlan"`
 }
 
@@ -49,14 +49,14 @@ type RoutePlan struct {
 
 // SwapInfo 交换信息
 type SwapInfo struct {
-	AmmKey       string `json:"ammKey"`
-	Label        string `json:"label"`
-	InputMint    string `json:"inputMint"`
-	OutputMint   string `json:"outputMint"`
-	InAmount     string `json:"inAmount"`
-	OutAmount    string `json:"outAmount"`
-	FeeAmount    string `json:"feeAmount"`
-	FeeMint      string `json:"feeMint"`
+	AmmKey     string `json:"ammKey"`
+	Label      string `json:"label"`
+	InputMint  string `json:"inputMint"`
+	OutputMint string `json:"outputMint"`
+	InAmount   string `json:"inAmount"`
+	OutAmount  string `json:"outAmount"`
+	FeeAmount  string `json:"feeAmount"`
+	FeeMint    string `json:"feeMint"`
 }
 
 // JupiterClient Jupiter 聚合器客户端
@@ -100,8 +100,8 @@ func (j *JupiterClient) GetQuote(ctx context.Context, inputMint, outputMint stri
 // GetSwap 获取交换指令
 func (j *JupiterClient) GetSwap(ctx context.Context, quote *JupiterQuoteResponse, userPublicKey string) (string, error) {
 	body := map[string]interface{}{
-		"quoteResponse": quote,
-		"userPublicKey": userPublicKey,
+		"quoteResponse":    quote,
+		"userPublicKey":    userPublicKey,
 		"wrapAndUnwrapSol": true,
 	}
 

@@ -9,12 +9,12 @@ import (
 
 // PriceResult 价格结果
 type PriceResult struct {
-	Token0  string  `json:"token0"`
-	Token1  string  `json:"token1"`
-	Price   float64 `json:"price"`
-	Pool    string  `json:"pool"`
-	Dex     string  `json:"dex"`
-	Chain   string  `json:"chain"`
+	Token0 string  `json:"token0"`
+	Token1 string  `json:"token1"`
+	Price  float64 `json:"price"`
+	Pool   string  `json:"pool"`
+	Dex    string  `json:"dex"`
+	Chain  string  `json:"chain"`
 }
 
 // TokenInfo 代币信息

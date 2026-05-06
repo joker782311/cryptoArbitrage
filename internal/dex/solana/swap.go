@@ -9,19 +9,19 @@ import (
 
 // SwapParams 交换参数
 type SwapParams struct {
-	InputMint      solana.PublicKey
-	OutputMint     solana.PublicKey
-	AmountIn       uint64
-	MinAmountOut   uint64
-	UserAccount    solana.PublicKey
+	InputMint    solana.PublicKey
+	OutputMint   solana.PublicKey
+	AmountIn     uint64
+	MinAmountOut uint64
+	UserAccount  solana.PublicKey
 }
 
 // SwapResult 交换结果
 type SwapResult struct {
-	Signature    solana.Signature
-	AmountIn     uint64
-	AmountOut    uint64
-	TxStatus     string
+	Signature solana.Signature
+	AmountIn  uint64
+	AmountOut uint64
+	TxStatus  string
 }
 
 // JupiterSwapExecutor Jupiter 交换执行器
