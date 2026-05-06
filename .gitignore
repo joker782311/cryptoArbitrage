@@ -1,0 +1,36 @@
+# Binlog
+logs/
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+.env
+.env.local
+.env.*.local
+
+# Build
+bin/
+dist/
+build/
+
+# Dependencies
+vendor/
+
+# Test
+coverage.out
+coverage.html
+
+# Frontend
+web/node_modules/
+web/dist/
+web/.env.local
