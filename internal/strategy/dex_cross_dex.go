@@ -1,18 +1,19 @@
 package strategy
 
 import (
+	"context"
 	"sync"
 	"time"
 )
 
 // DEXCrossDEXStrategy 跨 DEX 套利策略
 type DEXCrossDEXStrategy struct {
-	mu         sync.RWMutex
-	dexes      map[string]interface{} // DEX 实例
-	tokens     []string               // 监控的代币
-	minProfit  float64
-	maxAmount  float64
-	prices     map[string]map[string]PriceInfo // dex -> token -> price
+	mu                 sync.RWMutex
+	dexes              map[string]interface{} // DEX 实例
+	tokens             []string               // 监控的代币
+	minProfit          float64
+	maxAmount          float64
+	prices             map[string]map[string]PriceInfo // dex -> token -> price
 	opportunityHandler func(*Opportunity)
 }
 
@@ -128,6 +129,8 @@ func (s *DEXCrossDEXStrategy) CheckOpportunity(token string) *Opportunity {
 
 	return bestOpp
 }
+
+func (s *DEXCrossDEXStrategy) Start(_ context.Context) error { return nil }
 
 // GetConfig 获取策略配置
 func (s *DEXCrossDEXStrategy) GetConfig() map[string]interface{} {

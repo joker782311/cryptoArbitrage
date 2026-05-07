@@ -6,23 +6,23 @@ import (
 
 // Ticker 统一行情结构
 type Ticker struct {
-	Exchange         string  `json:"exchange"`
-	Symbol           string  `json:"symbol"`
-	Price            float64 `json:"price"`
-	Bid              float64 `json:"bid"`
-	Ask              float64 `json:"ask"`
-	Volume24h        float64 `json:"volume_24h"`
-	Change24h        float64 `json:"change_24h"`
-	High24h          float64 `json:"high_24h"`
-	Low24h           float64 `json:"low_24h"`
-	QuoteVolume24h   float64 `json:"quote_volume_24h"`
-	Timestamp        int64   `json:"timestamp"`
+	Exchange       string  `json:"exchange"`
+	Symbol         string  `json:"symbol"`
+	Price          float64 `json:"price"`
+	Bid            float64 `json:"bid"`
+	Ask            float64 `json:"ask"`
+	Volume24h      float64 `json:"volume_24h"`
+	Change24h      float64 `json:"change_24h"`
+	High24h        float64 `json:"high_24h"`
+	Low24h         float64 `json:"low_24h"`
+	QuoteVolume24h float64 `json:"quote_volume_24h"`
+	Timestamp      int64   `json:"timestamp"`
 }
 
 // OrderBook 统一订单簿结构
 type OrderBook struct {
-	Exchange string      `json:"exchange"`
-	Symbol   string      `json:"symbol"`
+	Exchange string       `json:"exchange"`
+	Symbol   string       `json:"symbol"`
 	Bids     []PriceLevel `json:"bids"`
 	Asks     []PriceLevel `json:"asks"`
 }
@@ -35,15 +35,15 @@ type PriceLevel struct {
 
 // Order 统一订单结构
 type Order struct {
-	Exchange  string  `json:"exchange"`
-	Symbol    string  `json:"symbol"`
-	Side      string  `json:"side"`
-	Type      string  `json:"type"`
-	Price     float64 `json:"price"`
-	Quantity  float64 `json:"quantity"`
+	Exchange    string  `json:"exchange"`
+	Symbol      string  `json:"symbol"`
+	Side        string  `json:"side"`
+	Type        string  `json:"type"`
+	Price       float64 `json:"price"`
+	Quantity    float64 `json:"quantity"`
 	ExecutedQty float64 `json:"executed_qty"`
-	Status    string  `json:"status"`
-	OrderID   string  `json:"order_id"`
+	Status      string  `json:"status"`
+	OrderID     string  `json:"order_id"`
 }
 
 // Balance 统一余额结构
@@ -72,6 +72,11 @@ type FundingRate struct {
 	Symbol      string  `json:"symbol"`
 	FundingRate float64 `json:"funding_rate"`
 	NextFunding int64   `json:"next_funding"`
+}
+
+// FuturesPricer 期货价格接口（仅 Binance 实现）
+type FuturesPricer interface {
+	GetFuturesTicker(ctx context.Context, symbol string) (*Ticker, error)
 }
 
 // Exchange 交易所接口

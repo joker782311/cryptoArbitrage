@@ -91,13 +91,23 @@ func main() {
 	strategyEngine.AddStrategy(fundingRateStrategy)
 
 	// 期现策略
-	spotFutureStrategy := strategy.NewSpotFutureStrategy(
-		"binance",
-		[]string{"BTCUSDT", "ETHUSDT"},
-		0.3,   // 最小基差 0.3%
-		15000, // 最大金额 15000 USDT
-	)
-	strategyEngine.AddStrategy(spotFutureStrategy)
+	if binanceEx, ok := exchanges["binance"]; ok {
+		if futuresPricer, ok := binanceEx.(exchange.FuturesPricer); ok {
+			spotFutureStrategy := strategy.NewSpotFutureStrategy(
+				"binance",
+				binanceEx,
+				futuresPricer,
+				[]string{"BTCUSDT", "ETHUSDT"},
+				0.3,   // 最小基差 0.3%
+				15000, // 最大金额 15000 USDT
+			)
+			strategyEngine.AddStrategy(spotFutureStrategy)
+		}
+	}
+
+	// 跨所期现模拟盘策略：真实行情发现机会，第一版只进入模拟执行/记录链路。
+	cexSpotPerpStrategy := strategy.NewCEXSpotPerpStrategy(strategy.DefaultCEXSpotPerpConfig())
+	strategyEngine.AddStrategy(cexSpotPerpStrategy)
 
 	// 三角套利策略
 	triangularStrategy := strategy.NewTriangularStrategy(

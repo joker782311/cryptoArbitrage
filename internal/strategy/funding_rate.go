@@ -1,6 +1,7 @@
 package strategy
 
 import (
+	"context"
 	"sync"
 	"time"
 
@@ -9,12 +10,12 @@ import (
 
 // FundingRateStrategy 资金费率套利策略
 type FundingRateStrategy struct {
-	mu         sync.RWMutex
-	exchanges  map[string]exchange.Exchange
-	pairs      []string
-	minRateDiff float64               // 最小费率差
-	maxAmount  float64
-	lastRates  map[string]map[string]float64 // exchange -> symbol -> rate
+	mu                 sync.RWMutex
+	exchanges          map[string]exchange.Exchange
+	pairs              []string
+	minRateDiff        float64 // 最小费率差
+	maxAmount          float64
+	lastRates          map[string]map[string]float64 // exchange -> symbol -> rate
 	opportunityHandler func(*Opportunity)
 }
 
@@ -116,6 +117,8 @@ func (s *FundingRateStrategy) CheckOpportunity(symbol string) *Opportunity {
 
 	return bestOpp
 }
+
+func (s *FundingRateStrategy) Start(_ context.Context) error { return nil }
 
 // GetConfig 获取策略配置
 func (s *FundingRateStrategy) GetConfig() map[string]interface{} {

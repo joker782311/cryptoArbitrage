@@ -163,6 +163,18 @@ func (a *BinanceAdapter) GetPositions(ctx context.Context) ([]Position, error) {
 	return result, nil
 }
 
+func (a *BinanceAdapter) GetFuturesTicker(ctx context.Context, symbol string) (*Ticker, error) {
+	t, err := a.client.GetFuturesTicker(ctx, symbol)
+	if err != nil {
+		return nil, err
+	}
+	return &Ticker{
+		Exchange: "binance",
+		Symbol:   t.Symbol,
+		Price:    t.Price,
+	}, nil
+}
+
 func (a *BinanceAdapter) SubscribeTicker(ctx context.Context, symbols []string, handler func(*Ticker)) error {
 	return a.client.SubscribeTicker(symbols, func(t *binance.Ticker) {
 		handler(&Ticker{

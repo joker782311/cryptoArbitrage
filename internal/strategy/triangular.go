@@ -1,19 +1,20 @@
 package strategy
 
 import (
+	"context"
 	"sync"
 	"time"
 )
 
 // TriangularStrategy 三角套利策略
 type TriangularStrategy struct {
-	mu         sync.RWMutex
-	exchange   string
-	exchangeInstance interface{} // 交易所实例
-	pairs      []TriPair
-	minProfit  float64
-	maxAmount  float64
-	prices     map[string]float64 // symbol -> price
+	mu                 sync.RWMutex
+	exchange           string
+	exchangeInstance   interface{} // 交易所实例
+	pairs              []TriPair
+	minProfit          float64
+	maxAmount          float64
+	prices             map[string]float64 // symbol -> price
 	opportunityHandler func(*Opportunity)
 }
 
@@ -129,6 +130,8 @@ func (s *TriangularStrategy) checkPath(path []string) *Opportunity {
 
 	return nil
 }
+
+func (s *TriangularStrategy) Start(_ context.Context) error { return nil }
 
 // GetConfig 获取策略配置
 func (s *TriangularStrategy) GetConfig() map[string]interface{} {

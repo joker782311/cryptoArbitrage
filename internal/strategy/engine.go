@@ -9,22 +9,27 @@ import (
 
 // Engine 策略引擎
 type Engine struct {
-	mu               sync.RWMutex
-	strategies       []Strategy
-	opportunityChan  chan *Opportunity
-	exchanges        map[string]exchange.Exchange
-	isRunning        bool
-	ctx              context.Context
-	cancel           context.CancelFunc
+	mu              sync.RWMutex
+	strategies      []Strategy
+	opportunityChan chan *Opportunity
+	exchanges       map[string]exchange.Exchange
+	isRunning       bool
+	ctx             context.Context
+	cancel          context.CancelFunc
 }
 
 // Strategy 策略接口
 type Strategy interface {
 	GetConfig() map[string]interface{}
+	Start(ctx context.Context) error
 }
 
 // OpportunityHandler 机会处理函数
 type OpportunityHandler func(*Opportunity)
+
+type opportunityHandlerSetter interface {
+	SetOpportunityHandler(func(*Opportunity))
+}
 
 // NewEngine 创建策略引擎
 func NewEngine(exchanges map[string]exchange.Exchange) *Engine {
@@ -39,6 +44,10 @@ func NewEngine(exchanges map[string]exchange.Exchange) *Engine {
 func (e *Engine) AddStrategy(s Strategy) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if setter, ok := s.(opportunityHandlerSetter); ok {
+		// 策略只负责发现机会，统一交给引擎通道处理，避免每个策略各自执行。
+		setter.SetOpportunityHandler(e.EmitOpportunity)
+	}
 	e.strategies = append(e.strategies, s)
 }
 
@@ -64,10 +73,17 @@ func (e *Engine) Start() error {
 
 	e.ctx, e.cancel = context.WithCancel(context.Background())
 	e.isRunning = true
+	strategies := make([]Strategy, len(e.strategies))
+	copy(strategies, e.strategies)
 	e.mu.Unlock()
 
-	// 启动机会处理协程
 	go e.processOpportunities()
+
+	for _, s := range strategies {
+		go func(strat Strategy) {
+			_ = strat.Start(e.ctx)
+		}(s)
+	}
 
 	return nil
 }
@@ -105,6 +121,7 @@ func (e *Engine) processOpportunities() {
 func handleOpportunity(opp *Opportunity) {
 	// 可以将机会记录到日志或数据库
 	// 或者发送到前端
+	_ = opp
 }
 
 // EmitOpportunity 发送机会到通道

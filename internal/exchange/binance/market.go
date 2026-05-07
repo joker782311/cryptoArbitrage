@@ -23,9 +23,9 @@ type Ticker struct {
 
 // OrderBook 订单簿
 type OrderBook struct {
-	LastUpdateID int64    `json:"lastUpdateId"`
-	Bids         []Level  `json:"bids"`
-	Asks         []Level  `json:"asks"`
+	LastUpdateID int64   `json:"lastUpdateId"`
+	Bids         []Level `json:"bids"`
+	Asks         []Level `json:"asks"`
 }
 
 // Level 价格层次
@@ -115,6 +115,26 @@ func (c *Client) GetFundingRate(ctx context.Context, symbol string) (*FundingRat
 	}
 
 	return &rate, nil
+}
+
+// FuturesTicker 期货最新价
+type FuturesTicker struct {
+	Symbol string  `json:"symbol"`
+	Price  float64 `json:"price,string"`
+}
+
+// GetFuturesTicker 获取永续合约最新价（不需要 API Key）
+func (c *Client) GetFuturesTicker(ctx context.Context, symbol string) (*FuturesTicker, error) {
+	url := fmt.Sprintf("%s/fapi/v1/ticker/price?symbol=%s", FuturesURL, symbol)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	var ticker FuturesTicker
+	if err := doRequest(c.Client, req, &ticker); err != nil {
+		return nil, err
+	}
+	return &ticker, nil
 }
 
 // GetTickers 获取所有币种行情
