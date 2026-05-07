@@ -1,19 +1,38 @@
 package handlers
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
 	"github.com/joker782311/cryptoArbitrage/internal/strategy"
 )
+
+var cexSpotPerpWSUpgrader = websocket.Upgrader{
+	ReadBufferSize:  1024,
+	WriteBufferSize: 1024,
+	CheckOrigin:     func(r *http.Request) bool { return true },
+}
 
 type cexSpotPerpState struct {
 	mu            sync.RWMutex
 	strategy      *strategy.CEXSpotPerpStrategy
 	simulator     *strategy.CEXSpotPerpSimulator
 	opportunities map[string]*strategy.Opportunity
+	symbols       []string
+	lastQuoteAt   int64
+	marketErrors  map[string]string
+	wsStatus      map[string]string
+	wsErrors      map[string]string
+	httpClient    *http.Client
 }
 
 var cexSpotPerpSim = newCEXSpotPerpState()
@@ -63,11 +82,343 @@ func newCEXSpotPerpState() *cexSpotPerpState {
 		},
 	}, cfg.DefaultLeverage)
 
-	return &cexSpotPerpState{
+	state := &cexSpotPerpState{
 		strategy:      s,
 		simulator:     sim,
 		opportunities: make(map[string]*strategy.Opportunity),
+		symbols:       cfg.Symbols,
+		marketErrors:  make(map[string]string),
+		wsStatus:      make(map[string]string),
+		wsErrors:      make(map[string]string),
+		httpClient:    &http.Client{Timeout: 5 * time.Second},
 	}
+	state.startOfficialMarketWebSockets()
+	state.startFundingPolling()
+	return state
+}
+
+func (s *cexSpotPerpState) startOfficialMarketWebSockets() {
+	go s.runBinanceBookTickerWS(strategy.MarketTypeSpot)
+	go s.runBinanceBookTickerWS(strategy.MarketTypePerp)
+	go s.runOKXTickerWS()
+	go s.runBitgetTickerWS(strategy.MarketTypeSpot)
+	go s.runBitgetTickerWS(strategy.MarketTypePerp)
+}
+
+func (s *cexSpotPerpState) startFundingPolling() {
+	go func() {
+		s.pollFundingOnce()
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			s.pollFundingOnce()
+		}
+	}()
+}
+
+func (s *cexSpotPerpState) pollFundingOnce() {
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	for _, symbol := range s.symbols {
+		for _, exchangeName := range []string{"binance", "okx", "bitget"} {
+			wg.Add(1)
+			go func(ex, sym string) {
+				defer wg.Done()
+				funding, err := s.fetchFundingRate(ctx, ex, sym)
+				if err != nil {
+					s.setMarketError(ex, sym, "funding", err)
+					return
+				}
+				s.updatePerpFunding(ex, sym, funding)
+				s.clearMarketError(ex, sym, "funding")
+			}(exchangeName, symbol)
+		}
+	}
+	wg.Wait()
+}
+
+func (s *cexSpotPerpState) setMarketError(exchangeName, symbol, kind string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.marketErrors[exchangeName+":"+symbol+":"+kind] = err.Error()
+}
+
+func (s *cexSpotPerpState) clearMarketError(exchangeName, symbol, kind string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.marketErrors, exchangeName+":"+symbol+":"+kind)
+	s.lastQuoteAt = time.Now().UnixMilli()
+}
+
+func (s *cexSpotPerpState) setWSStatus(name, status string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.wsStatus[name] = status
+	if status == "connected" {
+		delete(s.wsErrors, name)
+	}
+}
+
+func (s *cexSpotPerpState) setWSError(name string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.wsStatus[name] = "error"
+	s.wsErrors[name] = err.Error()
+}
+
+func (s *cexSpotPerpState) updateQuoteFromWS(q strategy.CEXSpotPerpQuote) {
+	s.strategy.UpdateQuote(q)
+	s.mu.Lock()
+	s.lastQuoteAt = time.Now().UnixMilli()
+	delete(s.marketErrors, q.Exchange+":"+q.Symbol+":"+q.MarketType)
+	s.mu.Unlock()
+}
+
+func (s *cexSpotPerpState) updatePerpFunding(exchangeName, symbol string, fundingRate float64) {
+	// CEXSpotPerpStrategy 目前只暴露完整 quote 更新；资金费率低频变化时，
+	// 用最近一次盘口近似补写 funding，不改变 bid/ask 的价格来源。
+	q := strategy.CEXSpotPerpQuote{
+		Exchange:    exchangeName,
+		Symbol:      symbol,
+		MarketType:  strategy.MarketTypePerp,
+		FundingRate: fundingRate,
+		Timestamp:   time.Now().UnixMilli(),
+	}
+	s.strategy.UpdateFunding(q)
+}
+
+func (s *cexSpotPerpState) fetchSpotQuote(ctx context.Context, exchangeName, symbol string) (strategy.CEXSpotPerpQuote, error) {
+	switch exchangeName {
+	case "binance":
+		var resp struct {
+			Symbol   string `json:"symbol"`
+			BidPrice string `json:"bidPrice"`
+			AskPrice string `json:"askPrice"`
+		}
+		if err := s.getJSON(ctx, "https://api.binance.com/api/v3/ticker/bookTicker?symbol="+url.QueryEscape(symbol), &resp); err != nil {
+			return strategy.CEXSpotPerpQuote{}, err
+		}
+		return quoteFromStrings(exchangeName, symbol, strategy.MarketTypeSpot, resp.BidPrice, resp.AskPrice, 0), nil
+	case "okx":
+		t, err := s.fetchOKXTicker(ctx, okxSpotSymbol(symbol))
+		if err != nil {
+			return strategy.CEXSpotPerpQuote{}, err
+		}
+		return quoteFromStrings(exchangeName, symbol, strategy.MarketTypeSpot, t.BidPx, t.AskPx, 0), nil
+	case "bitget":
+		var resp struct {
+			Data []struct {
+				BidPr string `json:"bidPr"`
+				AskPr string `json:"askPr"`
+			} `json:"data"`
+		}
+		if err := s.getBitgetJSON(ctx, "https://api.bitget.com/api/v2/spot/market/tickers?symbol="+url.QueryEscape(symbol), &resp); err != nil {
+			return strategy.CEXSpotPerpQuote{}, err
+		}
+		if len(resp.Data) == 0 {
+			return strategy.CEXSpotPerpQuote{}, fmt.Errorf("bitget spot ticker empty")
+		}
+		return quoteFromStrings(exchangeName, symbol, strategy.MarketTypeSpot, resp.Data[0].BidPr, resp.Data[0].AskPr, 0), nil
+	default:
+		return strategy.CEXSpotPerpQuote{}, fmt.Errorf("unsupported exchange: %s", exchangeName)
+	}
+}
+
+func (s *cexSpotPerpState) fetchPerpQuote(ctx context.Context, exchangeName, symbol string) (strategy.CEXSpotPerpQuote, error) {
+	switch exchangeName {
+	case "binance":
+		var resp struct {
+			Symbol   string `json:"symbol"`
+			BidPrice string `json:"bidPrice"`
+			AskPrice string `json:"askPrice"`
+		}
+		if err := s.getJSON(ctx, "https://fapi.binance.com/fapi/v1/ticker/bookTicker?symbol="+url.QueryEscape(symbol), &resp); err != nil {
+			return strategy.CEXSpotPerpQuote{}, err
+		}
+		return quoteFromStrings(exchangeName, symbol, strategy.MarketTypePerp, resp.BidPrice, resp.AskPrice, 0), nil
+	case "okx":
+		t, err := s.fetchOKXTicker(ctx, okxSwapSymbol(symbol))
+		if err != nil {
+			return strategy.CEXSpotPerpQuote{}, err
+		}
+		return quoteFromStrings(exchangeName, symbol, strategy.MarketTypePerp, t.BidPx, t.AskPx, 0), nil
+	case "bitget":
+		var resp struct {
+			Data json.RawMessage `json:"data"`
+		}
+		endpoint := fmt.Sprintf("https://api.bitget.com/api/v2/mix/market/ticker?symbol=%s&productType=USDT-FUTURES", url.QueryEscape(symbol))
+		if err := s.getBitgetJSON(ctx, endpoint, &resp); err != nil {
+			return strategy.CEXSpotPerpQuote{}, err
+		}
+		ticker, err := decodeBitgetTicker(resp.Data)
+		if err != nil {
+			return strategy.CEXSpotPerpQuote{}, err
+		}
+		return quoteFromStrings(exchangeName, symbol, strategy.MarketTypePerp, ticker.BidPr, ticker.AskPr, 0), nil
+	default:
+		return strategy.CEXSpotPerpQuote{}, fmt.Errorf("unsupported exchange: %s", exchangeName)
+	}
+}
+
+type bitgetTickerData struct {
+	BidPr string `json:"bidPr"`
+	AskPr string `json:"askPr"`
+}
+
+func decodeBitgetTicker(raw json.RawMessage) (bitgetTickerData, error) {
+	var one bitgetTickerData
+	if err := json.Unmarshal(raw, &one); err == nil && (one.BidPr != "" || one.AskPr != "") {
+		return one, nil
+	}
+	var many []bitgetTickerData
+	if err := json.Unmarshal(raw, &many); err != nil {
+		return bitgetTickerData{}, err
+	}
+	if len(many) == 0 {
+		return bitgetTickerData{}, fmt.Errorf("bitget ticker empty")
+	}
+	return many[0], nil
+}
+
+func (s *cexSpotPerpState) fetchFundingRate(ctx context.Context, exchangeName, symbol string) (float64, error) {
+	switch exchangeName {
+	case "binance":
+		var resp struct {
+			FundingRate string `json:"lastFundingRate"`
+		}
+		if err := s.getJSON(ctx, "https://fapi.binance.com/fapi/v1/premiumIndex?symbol="+url.QueryEscape(symbol), &resp); err != nil {
+			return 0, err
+		}
+		return strconv.ParseFloat(resp.FundingRate, 64)
+	case "okx":
+		var resp struct {
+			Data []struct {
+				FundingRate string `json:"fundingRate"`
+			} `json:"data"`
+		}
+		if err := s.getOKXJSON(ctx, "https://www.okx.com/api/v5/public/funding-rate?instId="+url.QueryEscape(okxSwapSymbol(symbol)), &resp); err != nil {
+			return 0, err
+		}
+		if len(resp.Data) == 0 {
+			return 0, fmt.Errorf("okx funding empty")
+		}
+		return strconv.ParseFloat(resp.Data[0].FundingRate, 64)
+	case "bitget":
+		var resp struct {
+			Data []struct {
+				FundingRate string `json:"fundingRate"`
+			} `json:"data"`
+		}
+		endpoint := fmt.Sprintf("https://api.bitget.com/api/v2/mix/market/current-fund-rate?symbol=%s&productType=USDT-FUTURES", url.QueryEscape(symbol))
+		if err := s.getBitgetJSON(ctx, endpoint, &resp); err != nil {
+			return 0, err
+		}
+		if len(resp.Data) == 0 {
+			return 0, fmt.Errorf("bitget funding empty")
+		}
+		return strconv.ParseFloat(resp.Data[0].FundingRate, 64)
+	default:
+		return 0, fmt.Errorf("unsupported exchange: %s", exchangeName)
+	}
+}
+
+type okxTickerData struct {
+	BidPx string `json:"bidPx"`
+	AskPx string `json:"askPx"`
+}
+
+func (s *cexSpotPerpState) fetchOKXTicker(ctx context.Context, instID string) (okxTickerData, error) {
+	var resp struct {
+		Data []okxTickerData `json:"data"`
+	}
+	if err := s.getOKXJSON(ctx, "https://www.okx.com/api/v5/market/ticker?instId="+url.QueryEscape(instID), &resp); err != nil {
+		return okxTickerData{}, err
+	}
+	if len(resp.Data) == 0 {
+		return okxTickerData{}, fmt.Errorf("okx ticker empty")
+	}
+	return resp.Data[0], nil
+}
+
+func (s *cexSpotPerpState) getJSON(ctx context.Context, endpoint string, out interface{}) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+		return fmt.Errorf("http %d: %s", resp.StatusCode, string(body))
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+func (s *cexSpotPerpState) getOKXJSON(ctx context.Context, endpoint string, out interface{}) error {
+	var envelope struct {
+		Code string          `json:"code"`
+		Msg  string          `json:"msg"`
+		Data json.RawMessage `json:"data"`
+	}
+	if err := s.getJSON(ctx, endpoint, &envelope); err != nil {
+		return err
+	}
+	if envelope.Code != "0" {
+		return fmt.Errorf("okx code=%s msg=%s", envelope.Code, envelope.Msg)
+	}
+	wrapped := struct {
+		Data json.RawMessage `json:"data"`
+	}{Data: envelope.Data}
+	b, _ := json.Marshal(wrapped)
+	return json.Unmarshal(b, out)
+}
+
+func (s *cexSpotPerpState) getBitgetJSON(ctx context.Context, endpoint string, out interface{}) error {
+	var envelope struct {
+		Code json.RawMessage `json:"code"`
+		Msg  string          `json:"msg"`
+		Data json.RawMessage `json:"data"`
+	}
+	if err := s.getJSON(ctx, endpoint, &envelope); err != nil {
+		return err
+	}
+	code := string(envelope.Code)
+	if code != `"00000"` && code != `"0"` && code != `0` {
+		return fmt.Errorf("bitget code=%s msg=%s", code, envelope.Msg)
+	}
+	wrapped := struct {
+		Data json.RawMessage `json:"data"`
+	}{Data: envelope.Data}
+	b, _ := json.Marshal(wrapped)
+	return json.Unmarshal(b, out)
+}
+
+func quoteFromStrings(exchangeName, symbol, marketType, bidText, askText string, fundingRate float64) strategy.CEXSpotPerpQuote {
+	bid, _ := strconv.ParseFloat(bidText, 64)
+	ask, _ := strconv.ParseFloat(askText, 64)
+	return strategy.CEXSpotPerpQuote{
+		Exchange:    exchangeName,
+		Symbol:      symbol,
+		MarketType:  marketType,
+		Bid:         bid,
+		Ask:         ask,
+		Last:        (bid + ask) / 2,
+		FundingRate: fundingRate,
+		Timestamp:   time.Now().UnixMilli(),
+	}
+}
+
+func okxSpotSymbol(symbol string) string {
+	return symbol[:len(symbol)-4] + "-USDT"
+}
+
+func okxSwapSymbol(symbol string) string {
+	return okxSpotSymbol(symbol) + "-SWAP"
 }
 
 func (s *cexSpotPerpState) snapshot() gin.H {
@@ -88,6 +439,10 @@ func (s *cexSpotPerpState) snapshot() gin.H {
 	if halted {
 		status = "halted"
 	}
+	marketErrors := make(map[string]string, len(s.marketErrors))
+	for key, value := range s.marketErrors {
+		marketErrors[key] = value
+	}
 
 	return gin.H{
 		"status":        status,
@@ -97,6 +452,8 @@ func (s *cexSpotPerpState) snapshot() gin.H {
 		"positions":     positionDTOs(s.simulator.Positions()),
 		"closeActions":  closeActionDTOs(s.simulator.CloseActions()),
 		"pnl":           s.simulator.PnLSummary(),
+		"lastQuoteAt":   s.lastQuoteAt,
+		"marketErrors":  marketErrors,
 	}
 }
 
@@ -261,4 +618,47 @@ func HaltCEXSpotPerpSimulation(c *gin.Context) {
 func ResumeCEXSpotPerpSimulation(c *gin.Context) {
 	cexSpotPerpSim.simulator.Resume()
 	c.JSON(http.StatusOK, cexSpotPerpSim.snapshot())
+}
+
+func CEXSpotPerpWebSocket(c *gin.Context) {
+	conn, err := cexSpotPerpWSUpgrader.Upgrade(c.Writer, c.Request, nil)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	// 客户端不需要发送业务消息，但读泵能及时感知浏览器断开，避免写协程悬挂。
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}()
+
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	if err := writeCEXSpotPerpSnapshot(conn); err != nil {
+		return
+	}
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			if err := writeCEXSpotPerpSnapshot(conn); err != nil {
+				return
+			}
+		}
+	}
+}
+
+func writeCEXSpotPerpSnapshot(conn *websocket.Conn) error {
+	return conn.WriteJSON(gin.H{
+		"type": "cex_spot_perp_snapshot",
+		"data": cexSpotPerpSim.snapshot(),
+	})
 }

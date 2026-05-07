@@ -3,11 +3,16 @@
     <div class="page-header">
       <div>
         <h2>跨所期现模拟盘</h2>
-        <div class="subtitle">Binance / OKX / Bitget · 现货与 U 本位永续组合扫描</div>
+        <div class="subtitle">
+          Binance / OKX / Bitget · 现货与 U 本位永续组合扫描 · 行情更新时间 {{ formatTs(lastQuoteAt) }}
+        </div>
       </div>
       <div class="header-actions">
         <el-tag :type="status === 'running' ? 'success' : 'danger'" size="large">
           {{ status === 'running' ? '运行中' : '已熔断' }}
+        </el-tag>
+        <el-tag :type="wsConnected ? 'success' : 'warning'" size="large">
+          {{ wsConnected ? 'WebSocket 实时' : 'WebSocket 重连中' }}
         </el-tag>
         <el-button :icon="Refresh" @click="store.fetchSimulation()">刷新</el-button>
         <el-button v-if="status === 'running'" type="danger" :icon="SwitchButton" @click="handleHalt">
@@ -27,30 +32,65 @@
       show-icon
       :title="`熔断原因：${haltReason}`"
     />
+    <el-alert
+      v-if="Object.keys(marketErrors).length > 0"
+      class="halt-alert"
+      type="warning"
+      :closable="false"
+      show-icon
+      :title="`部分行情源更新失败：${Object.keys(marketErrors).length} 项`"
+    />
 
     <el-row :gutter="16" class="summary-row">
       <el-col :xs="24" :sm="12" :lg="6">
         <el-card shadow="never" class="metric-card">
+          <div class="metric-label">累计净收益</div>
+          <div :class="pnl.totalPnL >= 0 ? 'metric-value profit' : 'metric-value loss'">
+            {{ signedMoney(pnl.totalPnL) }}
+          </div>
+        </el-card>
+      </el-col>
+      <el-col :xs="24" :sm="12" :lg="6">
+        <el-card shadow="never" class="metric-card">
+          <div class="metric-label">已实现收益</div>
+          <div :class="pnl.realizedPnL >= 0 ? 'metric-value profit' : 'metric-value loss'">
+            {{ signedMoney(pnl.realizedPnL) }}
+          </div>
+        </el-card>
+      </el-col>
+      <el-col :xs="24" :sm="12" :lg="6">
+        <el-card shadow="never" class="metric-card">
+          <div class="metric-label">未实现预估</div>
+          <div :class="pnl.unrealizedPnL >= 0 ? 'metric-value profit' : 'metric-value loss'">
+            {{ signedMoney(pnl.unrealizedPnL) }}
+          </div>
+        </el-card>
+      </el-col>
+      <el-col :xs="24" :sm="12" :lg="6">
+        <el-card shadow="never" class="metric-card">
+          <div class="metric-label">持仓本金 / 冻结保证金</div>
+          <div class="metric-value compact">{{ money(pnl.openNotional) }} / {{ money(totalFrozenUsdt) }}</div>
+        </el-card>
+      </el-col>
+    </el-row>
+
+    <el-row :gutter="16" class="summary-row secondary">
+      <el-col :xs="24" :sm="8">
+        <el-card shadow="never" class="metric-card small">
           <div class="metric-label">可用现货 USDT</div>
-          <div class="metric-value">{{ money(totalSpotUsdt) }}</div>
+          <div class="metric-value small-value">{{ money(totalSpotUsdt) }}</div>
         </el-card>
       </el-col>
-      <el-col :xs="24" :sm="12" :lg="6">
-        <el-card shadow="never" class="metric-card">
+      <el-col :xs="24" :sm="8">
+        <el-card shadow="never" class="metric-card small">
           <div class="metric-label">合约保证金账户</div>
-          <div class="metric-value">{{ money(totalPerpUsdt) }}</div>
+          <div class="metric-value small-value">{{ money(totalPerpUsdt) }}</div>
         </el-card>
       </el-col>
-      <el-col :xs="24" :sm="12" :lg="6">
-        <el-card shadow="never" class="metric-card">
-          <div class="metric-label">冻结保证金</div>
-          <div class="metric-value">{{ money(totalFrozenUsdt) }}</div>
-        </el-card>
-      </el-col>
-      <el-col :xs="24" :sm="12" :lg="6">
-        <el-card shadow="never" class="metric-card">
+      <el-col :xs="24" :sm="8">
+        <el-card shadow="never" class="metric-card small">
           <div class="metric-label">可执行机会</div>
-          <div class="metric-value">{{ readyOpportunities.length }}</div>
+          <div class="metric-value small-value">{{ readyOpportunities.length }}</div>
         </el-card>
       </el-col>
     </el-row>
@@ -183,6 +223,13 @@
               <span class="text-up strong">{{ signedMoney(row.netProfit) }}</span>
             </template>
           </el-table-column>
+          <el-table-column label="已实现收益" min-width="130">
+            <template #default="{ row }">
+              <span :class="row.realizedPnL >= 0 ? 'text-up strong' : 'text-down strong'">
+                {{ row.status === 'closed' ? signedMoney(row.realizedPnL) : '-' }}
+              </span>
+            </template>
+          </el-table-column>
           <el-table-column label="开仓时间" min-width="180">
             <template #default="{ row }">{{ formatTs(row.openedAt) }}</template>
           </el-table-column>
@@ -234,6 +281,7 @@
 </template>
 
 <script setup lang="ts">
+import { onMounted, onUnmounted } from 'vue'
 import { storeToRefs } from 'pinia'
 import { ElMessageBox } from 'element-plus'
 import { CaretRight, CloseBold, Refresh, SwitchButton, VideoPlay } from '@element-plus/icons-vue'
@@ -242,19 +290,30 @@ import { useCexSpotPerpStore, type SpotPerpDirection } from '@/stores/cexSpotPer
 const store = useCexSpotPerpStore()
 const {
   loading,
+  wsConnected,
   status,
   haltReason,
   accounts,
   opportunities,
   positions,
   closeActions,
+  lastQuoteAt,
+  marketErrors,
+  pnl,
   totalSpotUsdt,
   totalPerpUsdt,
   totalFrozenUsdt,
   readyOpportunities,
 } = storeToRefs(store)
 
-store.fetchSimulation()
+onMounted(() => {
+  store.fetchSimulation()
+  store.connectWebSocket()
+})
+
+onUnmounted(() => {
+  store.disconnectWebSocket()
+})
 
 const directionText = (direction: SpotPerpDirection) => {
   return direction === 'spot_long_perp_short' ? '买现货 + 空永续' : '卖库存 + 多永续'
@@ -366,9 +425,17 @@ h2 {
   margin-bottom: 16px;
 }
 
+.summary-row.secondary {
+  margin-top: -8px;
+}
+
 .metric-card {
   min-height: 92px;
   margin-bottom: 12px;
+}
+
+.metric-card.small {
+  min-height: 72px;
 }
 
 .metric-label {
@@ -381,6 +448,22 @@ h2 {
   color: #111827;
   font-size: 24px;
   font-weight: 700;
+}
+
+.metric-value.compact {
+  font-size: 18px;
+}
+
+.metric-value.profit {
+  color: #16a34a;
+}
+
+.metric-value.loss {
+  color: #dc2626;
+}
+
+.small-value {
+  font-size: 18px;
 }
 
 .main-tabs {

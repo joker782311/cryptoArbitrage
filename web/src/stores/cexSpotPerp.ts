@@ -65,6 +65,8 @@ export interface CloseAction {
 interface SimulationSnapshot {
   status: MarketStatus
   haltReason: string
+  lastQuoteAt: number
+  marketErrors: Record<string, string>
   accounts: SimAccount[]
   opportunities: SpotPerpOpportunity[]
   positions: SimPosition[]
@@ -79,12 +81,15 @@ interface SimulationSnapshot {
 
 export const useCexSpotPerpStore = defineStore('cexSpotPerp', () => {
   const loading = ref(false)
+  const wsConnected = ref(false)
   const status = ref<MarketStatus>('running')
   const haltReason = ref('')
   const accounts = ref<SimAccount[]>([])
   const opportunities = ref<SpotPerpOpportunity[]>([])
   const positions = ref<SimPosition[]>([])
   const closeActions = ref<CloseAction[]>([])
+  const lastQuoteAt = ref(0)
+  const marketErrors = ref<Record<string, string>>({})
   const pnl = ref({
     realizedPnL: 0,
     unrealizedPnL: 0,
@@ -97,6 +102,8 @@ export const useCexSpotPerpStore = defineStore('cexSpotPerp', () => {
   const totalFrozenUsdt = computed(() => accounts.value.reduce((sum, account) => sum + account.frozenUsdt, 0))
   const readyOpportunities = computed(() => opportunities.value.filter(opp => opp.status === 'ready'))
   const openPositions = computed(() => positions.value.filter(position => position.status === 'open'))
+  let ws: WebSocket | null = null
+  let reconnectTimer: number | undefined
 
   function hydrate(snapshot: SimulationSnapshot) {
     status.value = snapshot.status
@@ -105,6 +112,8 @@ export const useCexSpotPerpStore = defineStore('cexSpotPerp', () => {
     opportunities.value = snapshot.opportunities || []
     positions.value = snapshot.positions || []
     closeActions.value = snapshot.closeActions || []
+    lastQuoteAt.value = snapshot.lastQuoteAt || 0
+    marketErrors.value = snapshot.marketErrors || {}
     pnl.value = snapshot.pnl || { realizedPnL: 0, unrealizedPnL: 0, totalPnL: 0, openNotional: 0 }
   }
 
@@ -116,6 +125,45 @@ export const useCexSpotPerpStore = defineStore('cexSpotPerp', () => {
     } finally {
       loading.value = false
     }
+  }
+
+  function connectWebSocket() {
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return
+    if (reconnectTimer) {
+      window.clearTimeout(reconnectTimer)
+      reconnectTimer = undefined
+    }
+
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+    ws = new WebSocket(`${protocol}//${window.location.host}/api/v1/cex-spot-perp/ws`)
+
+    ws.onopen = () => {
+      wsConnected.value = true
+    }
+    ws.onmessage = (event) => {
+      const message = JSON.parse(event.data) as { type: string; data: SimulationSnapshot }
+      if (message.type === 'cex_spot_perp_snapshot') {
+        hydrate(message.data)
+      }
+    }
+    ws.onclose = () => {
+      wsConnected.value = false
+      ws = null
+      reconnectTimer = window.setTimeout(connectWebSocket, 2000)
+    }
+    ws.onerror = () => {
+      ws?.close()
+    }
+  }
+
+  function disconnectWebSocket() {
+    if (reconnectTimer) {
+      window.clearTimeout(reconnectTimer)
+      reconnectTimer = undefined
+    }
+    wsConnected.value = false
+    ws?.close()
+    ws = null
   }
 
   async function executeOpportunity(opp: SpotPerpOpportunity) {
@@ -141,12 +189,15 @@ export const useCexSpotPerpStore = defineStore('cexSpotPerp', () => {
 
   return {
     loading,
+    wsConnected,
     status,
     haltReason,
     accounts,
     opportunities,
     positions,
     closeActions,
+    lastQuoteAt,
+    marketErrors,
     pnl,
     totalSpotUsdt,
     totalPerpUsdt,
@@ -154,6 +205,8 @@ export const useCexSpotPerpStore = defineStore('cexSpotPerp', () => {
     readyOpportunities,
     openPositions,
     fetchSimulation,
+    connectWebSocket,
+    disconnectWebSocket,
     executeOpportunity,
     closePosition,
     triggerCircuitBreaker,

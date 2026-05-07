@@ -84,6 +84,7 @@ func NewServer() *Server {
 		v1.POST("/cex-spot-perp/positions/:id/close", handlers.CloseCEXSpotPerpPosition)
 		v1.POST("/cex-spot-perp/circuit-breaker", handlers.HaltCEXSpotPerpSimulation)
 		v1.POST("/cex-spot-perp/resume", handlers.ResumeCEXSpotPerpSimulation)
+		v1.GET("/cex-spot-perp/ws", handlers.CEXSpotPerpWebSocket)
 
 		// WebSocket
 		v1.GET("/ws", websocket.WebSocketHandler)
