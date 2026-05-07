@@ -23,6 +23,20 @@ export const useStrategyStore = defineStore('strategy', () => {
       // TODO: 替换为实际 API
       strategies.value = [
         {
+          name: 'cex_spot_perp',
+          displayName: '跨所期现模拟盘',
+          isEnabled: true,
+          autoExecute: true,
+          minProfitRate: 0.2,
+          maxPosition: 3000,
+          stopLossRate: 2,
+          config: {
+            directions: ['spot_long_perp_short', 'spot_short_inventory_perp_long'],
+            exchanges: ['binance', 'okx', 'bitget'],
+            symbols: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'],
+          },
+        },
+        {
           name: 'cross_exchange',
           displayName: '跨交易所套利',
           isEnabled: true,

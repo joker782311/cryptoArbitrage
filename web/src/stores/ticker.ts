@@ -23,11 +23,11 @@ export const useTickerStore = defineStore('ticker', () => {
   async function fetchTickers() {
     loading.value = true
     try {
-      const response = await api.get('/tickers')
+      const response = await api.get('/tickers') as unknown as { tickers?: Ticker[] } | Ticker[]
       console.log('Tickers response:', response)
       // axios interceptor 已返回 response.data
       // API 返回格式：{ tickers: [...] }
-      if (response && response.tickers && Array.isArray(response.tickers)) {
+      if (!Array.isArray(response) && response && response.tickers && Array.isArray(response.tickers)) {
         tickers.value = response.tickers
         console.log('Tickers loaded:', tickers.value.length)
       } else if (response && Array.isArray(response)) {

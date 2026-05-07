@@ -1,15 +1,14 @@
 <script setup lang="ts">
-import { ref } from 'vue'
 import { RouterLink, RouterView } from 'vue-router'
-
-const activeMenu = ref('dashboard')
+import { Bell, Briefcase, Coin, DataLine, Setting, Tools } from '@element-plus/icons-vue'
 
 const menuItems = [
-  { key: 'dashboard', name: '行情看板', icon: '📊', path: '/' },
-  { key: 'strategies', name: '策略配置', icon: '⚙️', path: '/strategies' },
-  { key: 'positions', name: '仓位管理', icon: '💼', path: '/positions' },
-  { key: 'alerts', name: '告警中心', icon: '🔔', path: '/alerts' },
-  { key: 'settings', name: '系统设置', icon: '🔧', path: '/settings' },
+  { key: 'dashboard', name: '行情看板', icon: DataLine, path: '/' },
+  { key: 'spot-perp', name: '期现模拟盘', icon: Coin, path: '/cex-spot-perp' },
+  { key: 'strategies', name: '策略配置', icon: Tools, path: '/strategies' },
+  { key: 'positions', name: '仓位管理', icon: Briefcase, path: '/positions' },
+  { key: 'alerts', name: '告警中心', icon: Bell, path: '/alerts' },
+  { key: 'settings', name: '系统设置', icon: Setting, path: '/settings' },
 ]
 </script>
 
@@ -17,7 +16,7 @@ const menuItems = [
   <div class="app">
     <aside class="sidebar">
       <div class="logo">
-        <h2>🚀 CryptoArbitrage</h2>
+        <h2>CryptoArbitrage</h2>
       </div>
       <nav class="menu">
         <RouterLink
@@ -27,7 +26,7 @@ const menuItems = [
           class="menu-item"
           active-class="active"
         >
-          <span class="icon">{{ item.icon }}</span>
+          <el-icon class="icon"><component :is="item.icon" /></el-icon>
           <span class="name">{{ item.name }}</span>
         </RouterLink>
       </nav>
@@ -84,6 +83,7 @@ body {
   color: #fff;
   font-size: 18px;
   font-weight: 600;
+  letter-spacing: 0;
 }
 
 .menu {
@@ -113,6 +113,7 @@ body {
 .icon {
   font-size: 18px;
   margin-right: 10px;
+  width: 18px;
 }
 
 .main-content {

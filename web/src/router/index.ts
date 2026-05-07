@@ -14,6 +14,11 @@ const router = createRouter({
       component: () => import('../views/Strategies.vue'),
     },
     {
+      path: '/cex-spot-perp',
+      name: 'cex-spot-perp',
+      component: () => import('../views/CexSpotPerp.vue'),
+    },
+    {
       path: '/positions',
       name: 'positions',
       component: () => import('../views/Positions.vue'),

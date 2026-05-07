@@ -78,6 +78,13 @@ func NewServer() *Server {
 		v1.GET("/risk/limits", handlers.GetStrategyLimits)
 		v1.PUT("/risk/limits/:name", handlers.UpdateStrategyLimit)
 
+		// 跨所期现模拟盘
+		v1.GET("/cex-spot-perp", handlers.GetCEXSpotPerpSimulation)
+		v1.POST("/cex-spot-perp/opportunities/:id/execute", handlers.ExecuteCEXSpotPerpOpportunity)
+		v1.POST("/cex-spot-perp/positions/:id/close", handlers.CloseCEXSpotPerpPosition)
+		v1.POST("/cex-spot-perp/circuit-breaker", handlers.HaltCEXSpotPerpSimulation)
+		v1.POST("/cex-spot-perp/resume", handlers.ResumeCEXSpotPerpSimulation)
+
 		// WebSocket
 		v1.GET("/ws", websocket.WebSocketHandler)
 	}

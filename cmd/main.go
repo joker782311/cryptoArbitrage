@@ -31,6 +31,23 @@ func main() {
 		panic(err)
 	}
 
+	// 本地调试跨所期现模拟盘时，可以跳过 MySQL/Redis，只启动 API。
+	// 这样前端不会因为数据库依赖没拉起来而退回到前端假数据。
+	if os.Getenv("SIMULATION_ONLY") == "true" {
+		handlers.InitHandlers(exchange.NewExchangeFactory())
+		apiServer := api.NewServer()
+		go func() {
+			logger.Log.Infof("Starting simulation-only API server on port %s", cfg.Server.Port)
+			if err := apiServer.Run(cfg.Server.Port); err != nil {
+				logger.Log.Fatalf("Failed to start API server: %v", err)
+			}
+		}()
+		quit := make(chan os.Signal, 1)
+		signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+		<-quit
+		return
+	}
+
 	// 初始化数据库
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?charset=utf8mb4&parseTime=True&loc=Local",
 		cfg.Database.User, cfg.Database.Password,

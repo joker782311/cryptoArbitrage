@@ -153,3 +153,33 @@ func TestCEXSpotPerp_SimulatorExecutesAndCircuitBreakerCreatesCloseActions(t *te
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, strategy.ErrSimCircuitBreakerActive))
 }
+
+func TestCEXSpotPerp_SimulatorClosesPosition(t *testing.T) {
+	s := strategy.NewCEXSpotPerpStrategy(testSpotPerpConfig())
+	s.UpdateQuote(strategy.CEXSpotPerpQuote{Exchange: "binance", Symbol: "BTCUSDT", MarketType: strategy.MarketTypeSpot, Bid: 9990, Ask: 10000})
+	s.UpdateQuote(strategy.CEXSpotPerpQuote{Exchange: "okx", Symbol: "BTCUSDT", MarketType: strategy.MarketTypePerp, Bid: 10100, Ask: 10110, FundingRate: 0.001})
+	opp := s.ScanSymbol("BTCUSDT")[0]
+
+	sim := strategy.NewCEXSpotPerpSimulator(map[string]*strategy.SimAccount{
+		"binance": {Exchange: "binance", USDT: 5000, PerpUSDT: 5000, SpotBalances: map[string]float64{}, PerpPositions: map[string]float64{}},
+		"okx":     {Exchange: "okx", USDT: 5000, PerpUSDT: 5000, SpotBalances: map[string]float64{}, PerpPositions: map[string]float64{}},
+	}, 3)
+
+	pos, err := sim.ExecuteOpportunity(opp)
+	require.NoError(t, err)
+	require.Equal(t, "open", pos.Status)
+
+	action, err := sim.ClosePosition(pos.ID, "manual close")
+	require.NoError(t, err)
+	assert.Equal(t, pos.ID, action.PositionID)
+	assert.Equal(t, "closed", pos.Status)
+	assert.Equal(t, opp.NetProfit, pos.RealizedPnL)
+
+	account, ok := sim.Account("okx")
+	require.True(t, ok)
+	assert.Equal(t, 0.0, account.FrozenUSDT)
+
+	pnl := sim.PnLSummary()
+	assert.Equal(t, opp.NetProfit, pnl["realizedPnL"])
+	assert.Equal(t, 0.0, pnl["unrealizedPnL"])
+}

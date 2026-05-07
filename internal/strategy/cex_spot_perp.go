@@ -30,6 +30,8 @@ var (
 	ErrSimCircuitBreakerActive     = errors.New("sim circuit breaker is active")
 	ErrSimUnsupportedDirection     = errors.New("unsupported spot-perp direction")
 	ErrSimOpportunityNotProfitable = errors.New("opportunity is not profitable after costs")
+	ErrSimPositionNotFound         = errors.New("sim position not found")
+	ErrSimPositionNotOpen          = errors.New("sim position is not open")
 )
 
 // CEXSpotPerpQuote 保存现货或永续的盘口快照。模拟盘用 ask/bid 估算成交价；
@@ -280,6 +282,7 @@ type SimArbitragePosition struct {
 	Trades      []SimTrade
 	Notional    float64
 	Margin      float64
+	RealizedPnL float64
 }
 
 type SimCloseAction struct {
@@ -350,12 +353,50 @@ func (s *CEXSpotPerpSimulator) Positions() []*SimArbitragePosition {
 	return result
 }
 
+func (s *CEXSpotPerpSimulator) PnLSummary() map[string]float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var realized, unrealized, openNotional float64
+	for _, pos := range s.positions {
+		if pos == nil || pos.Opportunity == nil {
+			continue
+		}
+		switch pos.Status {
+		case "closed":
+			realized += pos.RealizedPnL
+		case "open", "closing":
+			unrealized += pos.Opportunity.NetProfit
+			openNotional += pos.Notional
+		}
+	}
+	return map[string]float64{
+		"realizedPnL":   realized,
+		"unrealizedPnL": unrealized,
+		"totalPnL":      realized + unrealized,
+		"openNotional":  openNotional,
+	}
+}
+
 func (s *CEXSpotPerpSimulator) CloseActions() []SimCloseAction {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	result := make([]SimCloseAction, len(s.closeActions))
 	copy(result, s.closeActions)
 	return result
+}
+
+func (s *CEXSpotPerpSimulator) IsHalted() (bool, string) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.halted, s.haltReason
+}
+
+func (s *CEXSpotPerpSimulator) Resume() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.halted = false
+	s.haltReason = ""
 }
 
 func (s *CEXSpotPerpSimulator) ExecuteOpportunity(opp *Opportunity) (*SimArbitragePosition, error) {
@@ -431,6 +472,62 @@ func (s *CEXSpotPerpSimulator) ExecuteOpportunity(opp *Opportunity) (*SimArbitra
 	}
 	s.positions[position.ID] = position
 	return position, nil
+}
+
+// ClosePosition 执行普通模拟平仓。这里按开仓价反向平掉两条腿，
+// 重点验证账户释放、库存回补和持仓状态流转；真实盘必须改用实时盘口或真实成交回报。
+func (s *CEXSpotPerpSimulator) ClosePosition(positionID, reason string) (*SimCloseAction, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	pos, ok := s.positions[positionID]
+	if !ok || pos == nil {
+		return nil, ErrSimPositionNotFound
+	}
+	if pos.Status != "open" {
+		return nil, ErrSimPositionNotOpen
+	}
+
+	opp := pos.Opportunity
+	spotAccount, ok := s.accounts[opp.SpotExchange]
+	if !ok || spotAccount == nil {
+		return nil, fmt.Errorf("%w: %s", ErrSimAccountNotFound, opp.SpotExchange)
+	}
+	perpAccount, ok := s.accounts[opp.PerpExchange]
+	if !ok || perpAccount == nil {
+		return nil, fmt.Errorf("%w: %s", ErrSimAccountNotFound, opp.PerpExchange)
+	}
+
+	quantity := spotPerpQuantity(opp)
+	baseAsset := baseAssetFromSymbol(opp.Symbol)
+	switch opp.Direction {
+	case DirectionSpotLongPerpShort:
+		spotAccount.SpotBalances[baseAsset] = math.Max(0, spotAccount.SpotBalances[baseAsset]-quantity)
+		spotAccount.USDT += quantity * opp.PriceA
+		perpAccount.PerpPositions[opp.Symbol] += quantity
+	case DirectionSpotShortInventoryPerpLong:
+		spotAccount.USDT = math.Max(0, spotAccount.USDT-quantity*opp.PriceA)
+		spotAccount.SpotBalances[baseAsset] += quantity
+		perpAccount.PerpPositions[opp.Symbol] -= quantity
+	default:
+		return nil, ErrSimUnsupportedDirection
+	}
+
+	perpAccount.FrozenUSDT = math.Max(0, perpAccount.FrozenUSDT-pos.Margin)
+	pos.Status = "closed"
+	pos.ClosedAt = time.Now().UnixMilli()
+	// 第一版模拟盘没有实时平仓盘口，先把开仓时估算的净收益作为已实现收益。
+	// 后续接订单簿或真实成交回报时，应在这里改成真实平仓盈亏。
+	pos.RealizedPnL = opp.NetProfit
+
+	action := SimCloseAction{
+		PositionID: pos.ID,
+		Reason:     reason,
+		Legs:       closeLegsForOpportunity(opp),
+		CreatedAt:  pos.ClosedAt,
+	}
+	s.closeActions = append(s.closeActions, action)
+	return &action, nil
 }
 
 // TriggerCircuitBreaker 触发熔断：停止新开仓，并为所有未平组合生成紧急平仓动作。
