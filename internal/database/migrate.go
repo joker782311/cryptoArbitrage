@@ -13,5 +13,10 @@ func Migrate() error {
 		&model.AlertConfig{},
 		&model.Ticker{},
 		&model.FundingRate{},
+		&model.CEXSpotPerpAutomationSetting{},
+		&model.CEXSpotPerpOpportunityLog{},
+		&model.CEXSpotPerpAutoTrade{},
+		&model.CEXSpotPerpSimAccount{},
+		&model.CEXSpotPerpSimPosition{},
 	)
 }

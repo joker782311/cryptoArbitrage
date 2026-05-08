@@ -68,17 +68,20 @@
           </el-checkbox-group>
         </el-form-item>
         <el-form-item label="币种白名单">
-          <el-select
-            v-model="draftConfig.symbols"
-            multiple
-            filterable
-            allow-create
-            default-first-option
-            class="wide-select"
-            placeholder="输入交易对，例如 BTCUSDT"
-          >
-            <el-option v-for="symbol in commonSymbols" :key="symbol" :label="symbol" :value="symbol" />
-          </el-select>
+          <div class="symbol-picker">
+            <el-select
+              v-model="draftConfig.symbols"
+              multiple
+              filterable
+              allow-create
+              default-first-option
+              class="wide-select"
+              placeholder="输入交易对并回车新增，例如 BTCUSDT"
+            >
+              <el-option v-for="symbol in commonSymbols" :key="symbol" :label="symbol" :value="symbol" />
+            </el-select>
+            <el-button @click="applyTopSymbols">填入 Top20</el-button>
+          </div>
         </el-form-item>
         <el-form-item label="各所币种">
           <div class="exchange-symbols">
@@ -95,6 +98,41 @@
           <el-button v-if="hasUnsavedConfig" @click="resetDraftConfig">放弃修改</el-button>
           <el-tag v-if="hasUnsavedConfig" type="warning" effect="plain">有未保存配置</el-tag>
           <span class="muted">杠杆上限 3 倍，配置保存后会重新订阅行情源。</span>
+        </el-form-item>
+      </el-form>
+    </el-card>
+
+    <el-card shadow="never" class="config-panel">
+      <el-form label-width="130px" class="config-form">
+        <el-form-item label="自动开关仓">
+          <div class="automation-row">
+            <el-switch v-model="automationDraft.enabled" active-text="启用" inactive-text="关闭" />
+            <el-checkbox v-model="automationDraft.autoOpen">自动开仓</el-checkbox>
+            <el-checkbox v-model="automationDraft.autoClose">自动平仓</el-checkbox>
+            <el-button type="primary" @click="saveAutomation">保存自动化</el-button>
+            <el-button v-if="hasUnsavedAutomation" @click="resetAutomationDraft">放弃修改</el-button>
+            <el-tag v-if="hasUnsavedAutomation" type="warning" effect="plain">有未保存自动化</el-tag>
+            <span class="muted">自动化关闭时，仍可在机会扫描和持仓里手动开仓 / 平仓。</span>
+          </div>
+        </el-form-item>
+        <el-form-item label="开仓收益率">
+          <el-input-number v-model="automationDraft.openMinProfitRate" :min="0" :precision="3" :step="0.01" />
+          <span class="muted">机会收益率达到该阈值才允许自动开仓。</span>
+        </el-form-item>
+        <el-form-item label="平仓条件">
+          <div class="automation-row">
+            <span class="muted">预计收益率</span>
+            <el-input-number v-model="automationDraft.closeMinProfitRate" :min="0" :precision="3" :step="0.01" />
+            <span class="muted">最大持仓秒数</span>
+            <el-input-number v-model="automationDraft.maxHoldSeconds" :min="0" :precision="0" :step="30" />
+            <span class="muted">0 表示关闭该条件。</span>
+          </div>
+        </el-form-item>
+        <el-form-item label="仓位上限">
+          <div class="automation-row">
+            <el-input-number v-model="automationDraft.maxOpenPositions" :min="1" :max="20" :precision="0" />
+            <span class="muted">同一组合不会重复自动开仓。</span>
+          </div>
         </el-form-item>
       </el-form>
     </el-card>
@@ -149,6 +187,35 @@
         <el-card shadow="never" class="metric-card small">
           <div class="metric-label">可执行 / 观察机会</div>
           <div class="metric-value small-value">{{ readyOpportunities.length }} / {{ watchOpportunities.length }}</div>
+        </el-card>
+      </el-col>
+    </el-row>
+
+    <el-row :gutter="16" class="summary-row secondary">
+      <el-col :xs="24" :sm="6">
+        <el-card shadow="never" class="metric-card small">
+          <div class="metric-label">自动开仓 / 平仓</div>
+          <div class="metric-value small-value">{{ autoStats.autoOpenCount }} / {{ autoStats.autoCloseCount }}</div>
+        </el-card>
+      </el-col>
+      <el-col :xs="24" :sm="6">
+        <el-card shadow="never" class="metric-card small">
+          <div class="metric-label">自动胜率</div>
+          <div class="metric-value small-value">{{ autoStats.winRate.toFixed(2) }}%</div>
+        </el-card>
+      </el-col>
+      <el-col :xs="24" :sm="6">
+        <el-card shadow="never" class="metric-card small">
+          <div class="metric-label">自动累计利润</div>
+          <div :class="autoStats.totalProfit >= 0 ? 'metric-value small-value profit' : 'metric-value small-value loss'">
+            {{ signedMoney(autoStats.totalProfit) }}
+          </div>
+        </el-card>
+      </el-col>
+      <el-col :xs="24" :sm="6">
+        <el-card shadow="never" class="metric-card small">
+          <div class="metric-label">自动化状态</div>
+          <div class="metric-value small-value">{{ automation.enabled ? '已启用' : '已关闭' }}</div>
         </el-card>
       </el-col>
     </el-row>
@@ -241,6 +308,73 @@
                 模拟开仓
               </el-button>
             </template>
+          </el-table-column>
+        </el-table>
+      </el-tab-pane>
+
+      <el-tab-pane label="机会记录" name="opportunity-logs">
+        <el-table :data="opportunityLogs" stripe class="data-table" empty-text="暂无机会记录">
+          <el-table-column prop="symbol" label="交易对" min-width="110" />
+          <el-table-column label="方向" min-width="170">
+            <template #default="{ row }">{{ directionText(row.direction) }}</template>
+          </el-table-column>
+          <el-table-column label="组合" min-width="170">
+            <template #default="{ row }">{{ row.spotExchange }} / {{ row.perpExchange }}</template>
+          </el-table-column>
+          <el-table-column label="出现次数" min-width="100">
+            <template #default="{ row }">{{ row.seenCount }}</template>
+          </el-table-column>
+          <el-table-column label="最佳利润" min-width="130">
+            <template #default="{ row }">{{ signedMoney(row.bestProfit) }} / {{ row.bestProfitRate.toFixed(2) }}%</template>
+          </el-table-column>
+          <el-table-column label="最近利润" min-width="130">
+            <template #default="{ row }">{{ signedMoney(row.lastProfit) }} / {{ row.lastProfitRate.toFixed(2) }}%</template>
+          </el-table-column>
+          <el-table-column label="状态" min-width="100">
+            <template #default="{ row }">
+              <el-tag :type="row.lastStatus === 'ready' ? 'success' : row.lastStatus === 'watch' ? 'warning' : 'info'">
+                {{ row.lastStatus === 'ready' ? '可执行' : row.lastStatus === 'watch' ? '观察' : '不可执行' }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="自动开仓" min-width="100">
+            <template #default="{ row }">{{ row.autoOpenedCount }}</template>
+          </el-table-column>
+          <el-table-column label="最近出现" min-width="180">
+            <template #default="{ row }">{{ formatTs(row.lastSeenAt) }}</template>
+          </el-table-column>
+        </el-table>
+      </el-tab-pane>
+
+      <el-tab-pane label="自动交易" name="auto-trades">
+        <el-table :data="autoTrades" stripe class="data-table" empty-text="暂无自动交易记录">
+          <el-table-column prop="symbol" label="交易对" min-width="110" />
+          <el-table-column label="动作" min-width="90">
+            <template #default="{ row }">
+              <el-tag :type="row.action === 'open' ? 'success' : 'warning'">{{ row.action === 'open' ? '开仓' : '平仓' }}</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="方向" min-width="170">
+            <template #default="{ row }">{{ directionText(row.direction) }}</template>
+          </el-table-column>
+          <el-table-column label="组合" min-width="170">
+            <template #default="{ row }">{{ row.spotExchange }} / {{ row.perpExchange }}</template>
+          </el-table-column>
+          <el-table-column label="名义本金" min-width="120">
+            <template #default="{ row }">{{ money(row.notional) }}</template>
+          </el-table-column>
+          <el-table-column label="保证金" min-width="120">
+            <template #default="{ row }">{{ money(row.margin) }}</template>
+          </el-table-column>
+          <el-table-column label="资金占用" min-width="130">
+            <template #default="{ row }">{{ money(row.capitalUsed) }}</template>
+          </el-table-column>
+          <el-table-column label="利润" min-width="130">
+            <template #default="{ row }">{{ signedMoney(row.profit) }} / {{ row.profitRate.toFixed(2) }}%</template>
+          </el-table-column>
+          <el-table-column prop="reason" label="原因" min-width="260" />
+          <el-table-column label="时间" min-width="180">
+            <template #default="{ row }">{{ formatTs(row.createdAt) }}</template>
           </el-table-column>
         </el-table>
       </el-tab-pane>
@@ -448,7 +582,7 @@ import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { CaretRight, CloseBold, Refresh, Setting, SwitchButton, VideoPlay } from '@element-plus/icons-vue'
-import { useCexSpotPerpStore, type SpotPerpConfig, type SpotPerpDirection } from '@/stores/cexSpotPerp'
+import { useCexSpotPerpStore, type SpotPerpAutomation, type SpotPerpConfig, type SpotPerpDirection } from '@/stores/cexSpotPerp'
 
 const store = useCexSpotPerpStore()
 const {
@@ -462,6 +596,10 @@ const {
   opportunities,
   positions,
   closeActions,
+  opportunityLogs,
+  autoTrades,
+  automation,
+  autoStats,
   lastQuoteAt,
   marketErrors,
   wsStatus,
@@ -475,8 +613,14 @@ const {
 } = storeToRefs(store)
 
 const allExchanges = ['binance', 'okx', 'bitget']
-const commonSymbols = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT', 'DOGEUSDT']
+const commonSymbols = [
+  'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT',
+  'DOGEUSDT', 'ADAUSDT', 'TRXUSDT', 'LINKUSDT', 'AVAXUSDT',
+  'TONUSDT', 'SHIBUSDT', 'DOTUSDT', 'BCHUSDT', 'LTCUSDT',
+  'UNIUSDT', 'NEARUSDT', 'APTUSDT', 'ICPUSDT', 'ETCUSDT',
+]
 const configDraftStorageKey = 'cex-spot-perp-config-draft'
+const automationDraftStorageKey = 'cex-spot-perp-automation-draft'
 
 const cloneConfig = (value: SpotPerpConfig): SpotPerpConfig => ({
   ...value,
@@ -505,11 +649,49 @@ const readStoredDraftConfig = (): SpotPerpConfig | null => {
   }
 }
 
+const automationKey = (value: SpotPerpAutomation) => JSON.stringify({
+  enabled: value.enabled,
+  autoOpen: value.autoOpen,
+  autoClose: value.autoClose,
+  openMinProfitRate: Number(value.openMinProfitRate || 0),
+  closeMinProfitRate: Number(value.closeMinProfitRate || 0),
+  maxHoldSeconds: Number(value.maxHoldSeconds || 0),
+  maxOpenPositions: Number(value.maxOpenPositions || 0),
+  checkIntervalMillis: Number(value.checkIntervalMillis || 0),
+})
+
+const normalizeAutomation = (value: SpotPerpAutomation): SpotPerpAutomation => ({
+  enabled: Boolean(value.enabled),
+  autoOpen: Boolean(value.autoOpen),
+  autoClose: Boolean(value.autoClose),
+  openMinProfitRate: Math.max(0, Number(value.openMinProfitRate || 0)),
+  closeMinProfitRate: Math.max(0, Number(value.closeMinProfitRate || 0)),
+  maxHoldSeconds: Math.max(0, Math.floor(Number(value.maxHoldSeconds || 0))),
+  maxOpenPositions: Math.max(1, Math.floor(Number(value.maxOpenPositions || 1))),
+  checkIntervalMillis: Math.max(500, Math.floor(Number(value.checkIntervalMillis || 1000))),
+})
+
+const readStoredAutomationDraft = (): SpotPerpAutomation | null => {
+  const raw = window.localStorage.getItem(automationDraftStorageKey)
+  if (!raw) return null
+  try {
+    return normalizeAutomation(JSON.parse(raw) as SpotPerpAutomation)
+  } catch {
+    window.localStorage.removeItem(automationDraftStorageKey)
+    return null
+  }
+}
+
 const storedDraftConfig = readStoredDraftConfig()
 const draftConfig = reactive<SpotPerpConfig>(storedDraftConfig || cloneConfig(config.value))
 const savedConfigKey = ref(configKey(config.value))
 const isSyncingDraft = ref(false)
 const hasUnsavedConfig = ref(Boolean(storedDraftConfig))
+const storedAutomationDraft = readStoredAutomationDraft()
+const automationDraft = reactive<SpotPerpAutomation>(storedAutomationDraft || normalizeAutomation(automation.value))
+const savedAutomationKey = ref(automationKey(automation.value))
+const isSyncingAutomationDraft = ref(false)
+const hasUnsavedAutomation = ref(Boolean(storedAutomationDraft))
 const fundDraft = reactive({
   exchange: 'binance',
   usdt: 0,
@@ -551,6 +733,24 @@ watch(draftConfig, () => {
     window.localStorage.setItem(configDraftStorageKey, JSON.stringify(draftConfig))
   } else {
     window.localStorage.removeItem(configDraftStorageKey)
+  }
+}, { deep: true })
+
+watch(automation, (value) => {
+  savedAutomationKey.value = automationKey(value)
+  if (hasUnsavedAutomation.value) return
+  isSyncingAutomationDraft.value = true
+  Object.assign(automationDraft, normalizeAutomation(value))
+  isSyncingAutomationDraft.value = false
+}, { deep: true })
+
+watch(automationDraft, () => {
+  if (isSyncingAutomationDraft.value) return
+  hasUnsavedAutomation.value = automationKey(automationDraft) !== savedAutomationKey.value
+  if (hasUnsavedAutomation.value) {
+    window.localStorage.setItem(automationDraftStorageKey, JSON.stringify(normalizeAutomation(automationDraft)))
+  } else {
+    window.localStorage.removeItem(automationDraftStorageKey)
   }
 }, { deep: true })
 
@@ -608,6 +808,13 @@ const normalizeDraftConfig = (): SpotPerpConfig => {
   }
 }
 
+const applyTopSymbols = () => {
+  draftConfig.symbols = [...commonSymbols]
+  for (const exchange of draftConfig.exchanges) {
+    draftConfig.exchangeSymbols[exchange] = [...commonSymbols]
+  }
+}
+
 const saveConfig = async () => {
   const nextConfig = normalizeDraftConfig()
   if (nextConfig.symbols.length === 0 || nextConfig.exchanges.length === 0) {
@@ -624,12 +831,32 @@ const saveConfig = async () => {
   ElMessage.success('期现配置已保存')
 }
 
+const saveAutomation = async () => {
+  const nextAutomation = normalizeAutomation(automationDraft)
+  await store.updateAutomation(nextAutomation)
+  isSyncingAutomationDraft.value = true
+  Object.assign(automationDraft, nextAutomation)
+  savedAutomationKey.value = automationKey(nextAutomation)
+  hasUnsavedAutomation.value = false
+  window.localStorage.removeItem(automationDraftStorageKey)
+  isSyncingAutomationDraft.value = false
+  ElMessage.success('自动化配置已保存')
+}
+
 const resetDraftConfig = () => {
   isSyncingDraft.value = true
   Object.assign(draftConfig, cloneConfig(config.value))
   window.localStorage.removeItem(configDraftStorageKey)
   hasUnsavedConfig.value = false
   isSyncingDraft.value = false
+}
+
+const resetAutomationDraft = () => {
+  isSyncingAutomationDraft.value = true
+  Object.assign(automationDraft, normalizeAutomation(automation.value))
+  window.localStorage.removeItem(automationDraftStorageKey)
+  hasUnsavedAutomation.value = false
+  isSyncingAutomationDraft.value = false
 }
 
 const accountForFundDraft = () => {
@@ -822,6 +1049,14 @@ h2 {
   max-width: 520px;
 }
 
+.symbol-picker {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  width: 100%;
+  align-items: center;
+}
+
 .exchange-symbols {
   display: grid;
   gap: 10px;
@@ -877,6 +1112,13 @@ h2 {
 }
 
 .transfer-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+}
+
+.automation-row {
   display: flex;
   flex-wrap: wrap;
   gap: 12px;

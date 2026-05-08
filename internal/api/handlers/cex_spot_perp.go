@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -14,8 +15,12 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	"github.com/joker782311/cryptoArbitrage/internal/database"
+	"github.com/joker782311/cryptoArbitrage/internal/model"
 	"github.com/joker782311/cryptoArbitrage/internal/strategy"
 )
+
+const cexSpotPerpAutomationSettingName = "cex_spot_perp"
 
 var cexSpotPerpWSUpgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
@@ -24,21 +29,90 @@ var cexSpotPerpWSUpgrader = websocket.Upgrader{
 }
 
 type cexSpotPerpState struct {
-	mu              sync.RWMutex
-	strategy        *strategy.CEXSpotPerpStrategy
-	simulator       *strategy.CEXSpotPerpSimulator
-	opportunities   map[string]*strategy.Opportunity
-	symbols         []string
-	exchanges       []string
-	exchangeSymbols map[string][]string
-	minProfitRate   float64
-	leverage        float64
-	wsGeneration    int64
-	lastQuoteAt     int64
-	marketErrors    map[string]string
-	wsStatus        map[string]string
-	wsErrors        map[string]string
-	httpClient      *http.Client
+	mu                sync.RWMutex
+	strategy          *strategy.CEXSpotPerpStrategy
+	simulator         *strategy.CEXSpotPerpSimulator
+	opportunities     map[string]*strategy.Opportunity
+	opportunityLogs   map[string]*cexSpotPerpOpportunityLog
+	autoTrades        []cexSpotPerpAutoTrade
+	symbols           []string
+	exchanges         []string
+	exchangeSymbols   map[string][]string
+	minProfitRate     float64
+	leverage          float64
+	automation        cexSpotPerpAutomationConfig
+	autoStats         cexSpotPerpAutoStats
+	lastAutoCheckAt   int64
+	persistenceLoaded bool
+	wsGeneration      int64
+	lastQuoteAt       int64
+	marketErrors      map[string]string
+	wsStatus          map[string]string
+	wsErrors          map[string]string
+	httpClient        *http.Client
+}
+
+type cexSpotPerpAutomationConfig struct {
+	Enabled             bool    `json:"enabled"`
+	AutoOpen            bool    `json:"autoOpen"`
+	AutoClose           bool    `json:"autoClose"`
+	OpenMinProfitRate   float64 `json:"openMinProfitRate"`
+	CloseMinProfitRate  float64 `json:"closeMinProfitRate"`
+	MaxHoldSeconds      int64   `json:"maxHoldSeconds"`
+	MaxOpenPositions    int     `json:"maxOpenPositions"`
+	CheckIntervalMillis int64   `json:"checkIntervalMillis"`
+}
+
+type cexSpotPerpAutoStats struct {
+	AutoOpenCount   int     `json:"autoOpenCount"`
+	AutoCloseCount  int     `json:"autoCloseCount"`
+	WinCount        int     `json:"winCount"`
+	LossCount       int     `json:"lossCount"`
+	TotalProfit     float64 `json:"totalProfit"`
+	AverageProfit   float64 `json:"averageProfit"`
+	WinRate         float64 `json:"winRate"`
+	LastActionAt    int64   `json:"lastActionAt"`
+	LastActionError string  `json:"lastActionError"`
+}
+
+type cexSpotPerpOpportunityLog struct {
+	Key              string
+	ID               string
+	Symbol           string
+	Direction        string
+	SpotExchange     string
+	PerpExchange     string
+	FirstSeenAt      int64
+	LastSeenAt       int64
+	SeenCount        int
+	BestProfit       float64
+	BestProfitRate   float64
+	LastProfit       float64
+	LastProfitRate   float64
+	LastStatus       string
+	LastBlockReason  string
+	AutoOpenedCount  int
+	AutoRejectedNote string
+}
+
+type cexSpotPerpAutoTrade struct {
+	ID           string
+	PositionID   string
+	Opportunity  string
+	Symbol       string
+	Direction    string
+	SpotExchange string
+	PerpExchange string
+	Action       string
+	Reason       string
+	Quantity     float64
+	Notional     float64
+	Margin       float64
+	SpotValue    float64
+	CapitalUsed  float64
+	Profit       float64
+	ProfitRate   float64
+	CreatedAt    int64
 }
 
 var cexSpotPerpSim = newCEXSpotPerpState()
@@ -71,16 +145,27 @@ func newCEXSpotPerpState() *cexSpotPerpState {
 		strategy:        s,
 		simulator:       sim,
 		opportunities:   make(map[string]*strategy.Opportunity),
+		opportunityLogs: make(map[string]*cexSpotPerpOpportunityLog),
 		symbols:         cfg.Symbols,
 		exchanges:       cfg.Exchanges,
 		exchangeSymbols: cloneStringSliceMap(cfg.ExchangeSymbols),
 		minProfitRate:   cfg.MinNetProfitRate,
 		leverage:        cfg.DefaultLeverage,
-		lastQuoteAt:     time.Now().UnixMilli(),
-		marketErrors:    make(map[string]string),
-		wsStatus:        make(map[string]string),
-		wsErrors:        make(map[string]string),
-		httpClient:      &http.Client{Timeout: 5 * time.Second},
+		automation: cexSpotPerpAutomationConfig{
+			Enabled:             false,
+			AutoOpen:            true,
+			AutoClose:           true,
+			OpenMinProfitRate:   cfg.MinNetProfitRate,
+			CloseMinProfitRate:  0,
+			MaxHoldSeconds:      300,
+			MaxOpenPositions:    3,
+			CheckIntervalMillis: 1000,
+		},
+		lastQuoteAt:  time.Now().UnixMilli(),
+		marketErrors: make(map[string]string),
+		wsStatus:     make(map[string]string),
+		wsErrors:     make(map[string]string),
+		httpClient:   &http.Client{Timeout: 5 * time.Second},
 	}
 	state.startOfficialMarketWebSockets()
 	state.startFundingPolling()
@@ -111,6 +196,366 @@ func defaultCEXSpotPerpAccounts() map[string]*strategy.SimAccount {
 			PerpPositions: map[string]float64{},
 		},
 	}
+}
+
+func (s *cexSpotPerpState) ensurePersistenceLoaded() {
+	if database.DB == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.persistenceLoaded {
+		s.mu.Unlock()
+		return
+	}
+	s.persistenceLoaded = true
+	s.mu.Unlock()
+
+	var setting model.CEXSpotPerpAutomationSetting
+	if err := database.DB.First(&setting, "name = ?", cexSpotPerpAutomationSettingName).Error; err == nil {
+		s.mu.Lock()
+		s.automation = cexSpotPerpAutomationConfig{
+			Enabled:             setting.Enabled,
+			AutoOpen:            setting.AutoOpen,
+			AutoClose:           setting.AutoClose,
+			OpenMinProfitRate:   setting.OpenMinProfitRate,
+			CloseMinProfitRate:  setting.CloseMinProfitRate,
+			MaxHoldSeconds:      setting.MaxHoldSeconds,
+			MaxOpenPositions:    setting.MaxOpenPositions,
+			CheckIntervalMillis: setting.CheckIntervalMillis,
+		}
+		s.mu.Unlock()
+	} else {
+		s.persistAutomationSetting()
+	}
+
+	var logs []model.CEXSpotPerpOpportunityLog
+	if err := database.DB.Order("last_seen_at DESC").Limit(1000).Find(&logs).Error; err == nil {
+		s.mu.Lock()
+		for _, item := range logs {
+			s.opportunityLogs[item.Key] = &cexSpotPerpOpportunityLog{
+				Key:              item.Key,
+				ID:               item.OpportunityID,
+				Symbol:           item.Symbol,
+				Direction:        item.Direction,
+				SpotExchange:     item.SpotExchange,
+				PerpExchange:     item.PerpExchange,
+				FirstSeenAt:      item.FirstSeenAt,
+				LastSeenAt:       item.LastSeenAt,
+				SeenCount:        item.SeenCount,
+				BestProfit:       item.BestProfit,
+				BestProfitRate:   item.BestProfitRate,
+				LastProfit:       item.LastProfit,
+				LastProfitRate:   item.LastProfitRate,
+				LastStatus:       item.LastStatus,
+				LastBlockReason:  item.LastBlockReason,
+				AutoOpenedCount:  item.AutoOpenedCount,
+				AutoRejectedNote: item.AutoRejectedNote,
+			}
+		}
+		s.mu.Unlock()
+	}
+
+	var trades []model.CEXSpotPerpAutoTrade
+	if err := database.DB.Order("created_at_ms ASC").Find(&trades).Error; err == nil {
+		s.mu.Lock()
+		s.autoTrades = make([]cexSpotPerpAutoTrade, 0, len(trades))
+		s.autoStats = cexSpotPerpAutoStats{}
+		for _, item := range trades {
+			trade := cexSpotPerpAutoTrade{
+				ID:           item.ID,
+				PositionID:   item.PositionID,
+				Opportunity:  item.Opportunity,
+				Symbol:       item.Symbol,
+				Direction:    item.Direction,
+				SpotExchange: item.SpotExchange,
+				PerpExchange: item.PerpExchange,
+				Action:       item.Action,
+				Reason:       item.Reason,
+				Quantity:     item.Quantity,
+				Notional:     item.Notional,
+				Margin:       item.Margin,
+				SpotValue:    item.SpotValue,
+				CapitalUsed:  item.CapitalUsed,
+				Profit:       item.Profit,
+				ProfitRate:   item.ProfitRate,
+				CreatedAt:    item.CreatedAtMs,
+			}
+			s.autoTrades = append(s.autoTrades, trade)
+			s.applyAutoTradeStatsLocked(trade)
+		}
+		s.mu.Unlock()
+	}
+
+	var storedAccounts []model.CEXSpotPerpSimAccount
+	if err := database.DB.Find(&storedAccounts).Error; err == nil && len(storedAccounts) > 0 {
+		accounts := defaultCEXSpotPerpAccounts()
+		for _, item := range storedAccounts {
+			account, err := simAccountFromModel(item)
+			if err != nil {
+				continue
+			}
+			accounts[account.Exchange] = account
+		}
+		positions := s.loadPersistedSimPositions()
+		s.simulator.RestoreState(accounts, positions)
+	} else {
+		s.persistSimState()
+	}
+}
+
+func (s *cexSpotPerpState) persistAutomationSetting() {
+	if database.DB == nil {
+		return
+	}
+	s.mu.RLock()
+	cfg := s.automation
+	s.mu.RUnlock()
+	setting := model.CEXSpotPerpAutomationSetting{
+		Name:                cexSpotPerpAutomationSettingName,
+		Enabled:             cfg.Enabled,
+		AutoOpen:            cfg.AutoOpen,
+		AutoClose:           cfg.AutoClose,
+		OpenMinProfitRate:   cfg.OpenMinProfitRate,
+		CloseMinProfitRate:  cfg.CloseMinProfitRate,
+		MaxHoldSeconds:      cfg.MaxHoldSeconds,
+		MaxOpenPositions:    cfg.MaxOpenPositions,
+		CheckIntervalMillis: cfg.CheckIntervalMillis,
+		UpdatedAt:           time.Now(),
+	}
+	_ = database.DB.Save(&setting).Error
+}
+
+func persistCEXSpotPerpOpportunityLog(log cexSpotPerpOpportunityLog) {
+	if database.DB == nil {
+		return
+	}
+	item := model.CEXSpotPerpOpportunityLog{
+		Key:              log.Key,
+		OpportunityID:    log.ID,
+		Symbol:           log.Symbol,
+		Direction:        log.Direction,
+		SpotExchange:     log.SpotExchange,
+		PerpExchange:     log.PerpExchange,
+		FirstSeenAt:      log.FirstSeenAt,
+		LastSeenAt:       log.LastSeenAt,
+		SeenCount:        log.SeenCount,
+		BestProfit:       log.BestProfit,
+		BestProfitRate:   log.BestProfitRate,
+		LastProfit:       log.LastProfit,
+		LastProfitRate:   log.LastProfitRate,
+		LastStatus:       log.LastStatus,
+		LastBlockReason:  log.LastBlockReason,
+		AutoOpenedCount:  log.AutoOpenedCount,
+		AutoRejectedNote: log.AutoRejectedNote,
+		UpdatedAt:        time.Now(),
+	}
+	_ = database.DB.Save(&item).Error
+}
+
+func persistCEXSpotPerpAutoTrade(trade cexSpotPerpAutoTrade) {
+	if database.DB == nil {
+		return
+	}
+	item := model.CEXSpotPerpAutoTrade{
+		ID:           trade.ID,
+		PositionID:   trade.PositionID,
+		Opportunity:  trade.Opportunity,
+		Symbol:       trade.Symbol,
+		Direction:    trade.Direction,
+		SpotExchange: trade.SpotExchange,
+		PerpExchange: trade.PerpExchange,
+		Action:       trade.Action,
+		Reason:       trade.Reason,
+		Quantity:     trade.Quantity,
+		Notional:     trade.Notional,
+		Margin:       trade.Margin,
+		SpotValue:    trade.SpotValue,
+		CapitalUsed:  trade.CapitalUsed,
+		Profit:       trade.Profit,
+		ProfitRate:   trade.ProfitRate,
+		CreatedAtMs:  trade.CreatedAt,
+		CreatedAt:    time.UnixMilli(trade.CreatedAt),
+	}
+	_ = database.DB.Save(&item).Error
+}
+
+func (s *cexSpotPerpState) persistSimAccounts() {
+	if database.DB == nil {
+		return
+	}
+	now := time.Now()
+	for _, account := range s.simulator.Accounts() {
+		if account == nil {
+			continue
+		}
+		item, err := simAccountToModel(account, now)
+		if err != nil {
+			continue
+		}
+		_ = database.DB.Save(&item).Error
+	}
+}
+
+func (s *cexSpotPerpState) persistSimState() {
+	s.persistSimAccounts()
+	s.persistSimPositions()
+}
+
+func (s *cexSpotPerpState) persistSimPositions() {
+	if database.DB == nil {
+		return
+	}
+	positions := s.simulator.Positions()
+	active := make(map[string]bool, len(positions))
+	now := time.Now()
+	for _, pos := range positions {
+		if pos == nil || pos.ID == "" {
+			continue
+		}
+		item, err := simPositionToModel(pos, now)
+		if err != nil {
+			continue
+		}
+		active[pos.ID] = true
+		_ = database.DB.Save(&item).Error
+	}
+	var stored []model.CEXSpotPerpSimPosition
+	if err := database.DB.Find(&stored).Error; err != nil {
+		return
+	}
+	for _, item := range stored {
+		if !active[item.ID] {
+			_ = database.DB.Delete(&model.CEXSpotPerpSimPosition{}, "id = ?", item.ID).Error
+		}
+	}
+}
+
+func (s *cexSpotPerpState) loadPersistedSimPositions() []*strategy.SimArbitragePosition {
+	if database.DB == nil {
+		return nil
+	}
+	var stored []model.CEXSpotPerpSimPosition
+	if err := database.DB.Order("opened_at ASC").Find(&stored).Error; err != nil {
+		return nil
+	}
+	positions := make([]*strategy.SimArbitragePosition, 0, len(stored))
+	for _, item := range stored {
+		pos, err := simPositionFromModel(item)
+		if err != nil {
+			continue
+		}
+		positions = append(positions, pos)
+	}
+	return positions
+}
+
+func simAccountToModel(account *strategy.SimAccount, now time.Time) (model.CEXSpotPerpSimAccount, error) {
+	spotBalances, err := json.Marshal(account.SpotBalances)
+	if err != nil {
+		return model.CEXSpotPerpSimAccount{}, err
+	}
+	perpPositions, err := json.Marshal(account.PerpPositions)
+	if err != nil {
+		return model.CEXSpotPerpSimAccount{}, err
+	}
+	return model.CEXSpotPerpSimAccount{
+		Exchange:      account.Exchange,
+		USDT:          account.USDT,
+		PerpUSDT:      account.PerpUSDT,
+		FrozenUSDT:    account.FrozenUSDT,
+		SpotBalances:  string(spotBalances),
+		PerpPositions: string(perpPositions),
+		UpdatedAt:     now,
+	}, nil
+}
+
+func simAccountFromModel(item model.CEXSpotPerpSimAccount) (*strategy.SimAccount, error) {
+	spotBalances := make(map[string]float64)
+	if strings.TrimSpace(item.SpotBalances) != "" {
+		if err := json.Unmarshal([]byte(item.SpotBalances), &spotBalances); err != nil {
+			return nil, err
+		}
+	}
+	perpPositions := make(map[string]float64)
+	if strings.TrimSpace(item.PerpPositions) != "" {
+		if err := json.Unmarshal([]byte(item.PerpPositions), &perpPositions); err != nil {
+			return nil, err
+		}
+	}
+	return &strategy.SimAccount{
+		Exchange:      item.Exchange,
+		USDT:          item.USDT,
+		PerpUSDT:      item.PerpUSDT,
+		FrozenUSDT:    item.FrozenUSDT,
+		SpotBalances:  spotBalances,
+		PerpPositions: perpPositions,
+	}, nil
+}
+
+func simPositionToModel(pos *strategy.SimArbitragePosition, now time.Time) (model.CEXSpotPerpSimPosition, error) {
+	opportunityJSON, err := json.Marshal(pos.Opportunity)
+	if err != nil {
+		return model.CEXSpotPerpSimPosition{}, err
+	}
+	tradesJSON, err := json.Marshal(pos.Trades)
+	if err != nil {
+		return model.CEXSpotPerpSimPosition{}, err
+	}
+	symbol := ""
+	direction := ""
+	spotExchange := ""
+	perpExchange := ""
+	opportunityID := ""
+	if pos.Opportunity != nil {
+		symbol = pos.Opportunity.Symbol
+		direction = pos.Opportunity.Direction
+		spotExchange = pos.Opportunity.SpotExchange
+		perpExchange = pos.Opportunity.PerpExchange
+		opportunityID = pos.Opportunity.ID
+	}
+	return model.CEXSpotPerpSimPosition{
+		ID:              pos.ID,
+		OpportunityID:   opportunityID,
+		Symbol:          symbol,
+		Direction:       direction,
+		SpotExchange:    spotExchange,
+		PerpExchange:    perpExchange,
+		Status:          pos.Status,
+		OpenedAt:        pos.OpenedAt,
+		ClosedAt:        pos.ClosedAt,
+		Notional:        pos.Notional,
+		Margin:          pos.Margin,
+		RealizedPnL:     pos.RealizedPnL,
+		OpportunityJSON: string(opportunityJSON),
+		TradesJSON:      string(tradesJSON),
+		UpdatedAt:       now,
+	}, nil
+}
+
+func simPositionFromModel(item model.CEXSpotPerpSimPosition) (*strategy.SimArbitragePosition, error) {
+	var opp strategy.Opportunity
+	if strings.TrimSpace(item.OpportunityJSON) != "" {
+		if err := json.Unmarshal([]byte(item.OpportunityJSON), &opp); err != nil {
+			return nil, err
+		}
+	}
+	var trades []strategy.SimTrade
+	if strings.TrimSpace(item.TradesJSON) != "" {
+		if err := json.Unmarshal([]byte(item.TradesJSON), &trades); err != nil {
+			return nil, err
+		}
+	}
+	return &strategy.SimArbitragePosition{
+		ID:          item.ID,
+		Opportunity: &opp,
+		Status:      item.Status,
+		OpenedAt:    item.OpenedAt,
+		ClosedAt:    item.ClosedAt,
+		Trades:      trades,
+		Notional:    item.Notional,
+		Margin:      item.Margin,
+		RealizedPnL: item.RealizedPnL,
+	}, nil
 }
 
 func (s *cexSpotPerpState) startOfficialMarketWebSockets() {
@@ -727,10 +1172,13 @@ func okxSymbolToPlain(instID string) string {
 }
 
 func (s *cexSpotPerpState) snapshot() gin.H {
+	s.ensurePersistenceLoaded()
+
 	s.mu.RLock()
 	symbols := append([]string(nil), s.symbols...)
 	minProfitRate := s.minProfitRate
 	lastQuoteAt := s.lastQuoteAt
+	automation := s.automation
 	config := gin.H{
 		"symbols":               append([]string(nil), s.symbols...),
 		"exchanges":             append([]string(nil), s.exchanges...),
@@ -760,12 +1208,17 @@ func (s *cexSpotPerpState) snapshot() gin.H {
 	for _, symbol := range symbols {
 		for _, opp := range s.strategy.ScanSymbolCandidates(symbol) {
 			nextOpportunities[opp.ID] = opp
+			status, blockReason := opportunityStatus(opp, minProfitRate)
+			s.recordOpportunityLog(opp, status, blockReason)
 			opps = append(opps, opportunityDTO(opp, minProfitRate))
 		}
 	}
 	s.mu.Lock()
 	s.opportunities = nextOpportunities
 	s.mu.Unlock()
+	if automation.Enabled {
+		s.runAutomation(nextOpportunities, minProfitRate)
+	}
 
 	halted, reason := s.simulator.IsHalted()
 	status := "running"
@@ -774,19 +1227,23 @@ func (s *cexSpotPerpState) snapshot() gin.H {
 	}
 
 	return gin.H{
-		"status":        status,
-		"haltReason":    reason,
-		"config":        config,
-		"accounts":      s.accountDTOs(),
-		"quotes":        quoteDTOs(s.strategy.QuoteStatuses(), enabledQuoteSymbols),
-		"opportunities": opps,
-		"positions":     positionDTOs(s.simulator.Positions()),
-		"closeActions":  closeActionDTOs(s.simulator.CloseActions()),
-		"pnl":           s.simulator.PnLSummary(),
-		"lastQuoteAt":   lastQuoteAt,
-		"marketErrors":  marketErrors,
-		"wsStatus":      wsStatus,
-		"wsErrors":      wsErrors,
+		"status":          status,
+		"haltReason":      reason,
+		"config":          config,
+		"accounts":        s.accountDTOs(),
+		"quotes":          quoteDTOs(s.strategy.QuoteStatuses(), enabledQuoteSymbols),
+		"opportunities":   opps,
+		"positions":       positionDTOs(s.simulator.Positions()),
+		"closeActions":    closeActionDTOs(s.simulator.CloseActions()),
+		"opportunityLogs": s.opportunityLogDTOs(),
+		"autoTrades":      s.autoTradeDTOs(),
+		"automation":      s.automationDTO(),
+		"autoStats":       s.autoStatsDTO(),
+		"pnl":             s.simulator.PnLSummary(),
+		"lastQuoteAt":     lastQuoteAt,
+		"marketErrors":    marketErrors,
+		"wsStatus":        wsStatus,
+		"wsErrors":        wsErrors,
 	}
 }
 
@@ -825,6 +1282,157 @@ func quoteEnabled(exchangeName, symbol string, enabledSymbols map[string][]strin
 	return false
 }
 
+func (s *cexSpotPerpState) recordOpportunityLog(opp *strategy.Opportunity, status, blockReason string) {
+	if opp == nil {
+		return
+	}
+	// 机会记录只保存扣除手续费、滑点和安全缓冲后的正净收益机会。
+	// 亏损或零收益的候选仍会出现在实时扫描表里用于观察，但不进入历史统计，
+	// 否则行情每秒刷新会把“没有套利空间”的组合刷成大量无效记录。
+	if opp.NetProfit <= 0 {
+		return
+	}
+	now := time.Now().UnixMilli()
+	key := opportunityStableKey(opp)
+	var snapshot cexSpotPerpOpportunityLog
+	s.mu.Lock()
+	log := s.opportunityLogs[key]
+	if log == nil {
+		log = &cexSpotPerpOpportunityLog{
+			Key:            key,
+			ID:             opp.ID,
+			Symbol:         opp.Symbol,
+			Direction:      opp.Direction,
+			SpotExchange:   opp.SpotExchange,
+			PerpExchange:   opp.PerpExchange,
+			FirstSeenAt:    now,
+			BestProfit:     opp.NetProfit,
+			BestProfitRate: opp.ProfitRate,
+		}
+		s.opportunityLogs[key] = log
+	}
+	log.ID = opp.ID
+	log.LastSeenAt = now
+	log.SeenCount++
+	log.LastProfit = opp.NetProfit
+	log.LastProfitRate = opp.ProfitRate
+	log.LastStatus = status
+	log.LastBlockReason = blockReason
+	if opp.NetProfit > log.BestProfit {
+		log.BestProfit = opp.NetProfit
+		log.BestProfitRate = opp.ProfitRate
+	}
+	snapshot = *log
+	s.mu.Unlock()
+	persistCEXSpotPerpOpportunityLog(snapshot)
+}
+
+func (s *cexSpotPerpState) opportunityLogDTOs() []gin.H {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	logs := make([]*cexSpotPerpOpportunityLog, 0, len(s.opportunityLogs))
+	for _, log := range s.opportunityLogs {
+		if log.BestProfit <= 0 {
+			continue
+		}
+		logs = append(logs, log)
+	}
+	sort.Slice(logs, func(i, j int) bool {
+		return logs[i].LastSeenAt > logs[j].LastSeenAt
+	})
+	if len(logs) > 200 {
+		logs = logs[:200]
+	}
+	result := make([]gin.H, 0, len(logs))
+	for _, log := range logs {
+		result = append(result, gin.H{
+			"key":              log.Key,
+			"id":               log.ID,
+			"symbol":           log.Symbol,
+			"direction":        log.Direction,
+			"spotExchange":     log.SpotExchange,
+			"perpExchange":     log.PerpExchange,
+			"firstSeenAt":      log.FirstSeenAt,
+			"lastSeenAt":       log.LastSeenAt,
+			"seenCount":        log.SeenCount,
+			"bestProfit":       log.BestProfit,
+			"bestProfitRate":   log.BestProfitRate,
+			"lastProfit":       log.LastProfit,
+			"lastProfitRate":   log.LastProfitRate,
+			"lastStatus":       log.LastStatus,
+			"lastBlockReason":  log.LastBlockReason,
+			"autoOpenedCount":  log.AutoOpenedCount,
+			"autoRejectedNote": log.AutoRejectedNote,
+		})
+	}
+	return result
+}
+
+func (s *cexSpotPerpState) automationDTO() gin.H {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return gin.H{
+		"enabled":             s.automation.Enabled,
+		"autoOpen":            s.automation.AutoOpen,
+		"autoClose":           s.automation.AutoClose,
+		"openMinProfitRate":   s.automation.OpenMinProfitRate,
+		"closeMinProfitRate":  s.automation.CloseMinProfitRate,
+		"maxHoldSeconds":      s.automation.MaxHoldSeconds,
+		"maxOpenPositions":    s.automation.MaxOpenPositions,
+		"checkIntervalMillis": s.automation.CheckIntervalMillis,
+	}
+}
+
+func (s *cexSpotPerpState) autoStatsDTO() gin.H {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	stats := s.autoStats
+	return gin.H{
+		"autoOpenCount":   stats.AutoOpenCount,
+		"autoCloseCount":  stats.AutoCloseCount,
+		"winCount":        stats.WinCount,
+		"lossCount":       stats.LossCount,
+		"totalProfit":     stats.TotalProfit,
+		"averageProfit":   stats.AverageProfit,
+		"winRate":         stats.WinRate,
+		"lastActionAt":    stats.LastActionAt,
+		"lastActionError": stats.LastActionError,
+	}
+}
+
+func (s *cexSpotPerpState) autoTradeDTOs() []gin.H {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	start := 0
+	if len(s.autoTrades) > 200 {
+		start = len(s.autoTrades) - 200
+	}
+	result := make([]gin.H, 0, len(s.autoTrades)-start)
+	for i := len(s.autoTrades) - 1; i >= start; i-- {
+		trade := s.autoTrades[i]
+		result = append(result, gin.H{
+			"id":           trade.ID,
+			"positionId":   trade.PositionID,
+			"opportunity":  trade.Opportunity,
+			"symbol":       trade.Symbol,
+			"direction":    trade.Direction,
+			"spotExchange": trade.SpotExchange,
+			"perpExchange": trade.PerpExchange,
+			"action":       trade.Action,
+			"reason":       trade.Reason,
+			"quantity":     trade.Quantity,
+			"notional":     trade.Notional,
+			"margin":       trade.Margin,
+			"spotValue":    trade.SpotValue,
+			"capitalUsed":  trade.CapitalUsed,
+			"profit":       trade.Profit,
+			"profitRate":   trade.ProfitRate,
+			"createdAt":    trade.CreatedAt,
+		})
+	}
+	return result
+}
+
 func (s *cexSpotPerpState) configDTO() gin.H {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -858,7 +1466,7 @@ func (s *cexSpotPerpState) accountDTOs() []gin.H {
 	return result
 }
 
-func opportunityDTO(opp *strategy.Opportunity, minProfitRate float64) gin.H {
+func opportunityStatus(opp *strategy.Opportunity, minProfitRate float64) (string, string) {
 	status := "ready"
 	blockReason := ""
 	if opp.NetProfit <= 0 {
@@ -878,6 +1486,11 @@ func opportunityDTO(opp *strategy.Opportunity, minProfitRate float64) gin.H {
 			blockReason = fmt.Sprintf("收益率 %.4f%% 低于阈值 %.4f%%", opp.ProfitRate, minProfitRate)
 		}
 	}
+	return status, blockReason
+}
+
+func opportunityDTO(opp *strategy.Opportunity, minProfitRate float64) gin.H {
+	status, blockReason := opportunityStatus(opp, minProfitRate)
 	return gin.H{
 		"id":                    opp.ID,
 		"symbol":                opp.Symbol,
@@ -900,6 +1513,269 @@ func opportunityDTO(opp *strategy.Opportunity, minProfitRate float64) gin.H {
 		"carryFundingIntervals": opp.CarryFundingIntervals,
 		"status":                status,
 		"blockReason":           blockReason,
+	}
+}
+
+func opportunityStableKey(opp *strategy.Opportunity) string {
+	if opp == nil {
+		return ""
+	}
+	return strings.Join([]string{opp.Symbol, opp.Direction, opp.SpotExchange, opp.PerpExchange}, ":")
+}
+
+func opportunityHedgeKey(opp *strategy.Opportunity) string {
+	if opp == nil {
+		return ""
+	}
+	return strings.Join([]string{opp.Symbol, opp.SpotExchange, opp.PerpExchange}, ":")
+}
+
+func persistenceIDPart(value string) string {
+	value = strings.ReplaceAll(value, ":", "-")
+	value = strings.ReplaceAll(value, "/", "-")
+	value = strings.ReplaceAll(value, " ", "-")
+	return value
+}
+
+func (s *cexSpotPerpState) runAutomation(opps map[string]*strategy.Opportunity, minProfitRate float64) {
+	now := time.Now().UnixMilli()
+	s.mu.Lock()
+	cfg := s.automation
+	if cfg.CheckIntervalMillis <= 0 {
+		cfg.CheckIntervalMillis = 1000
+	}
+	if s.lastAutoCheckAt > 0 && now-s.lastAutoCheckAt < cfg.CheckIntervalMillis {
+		s.mu.Unlock()
+		return
+	}
+	s.lastAutoCheckAt = now
+	s.mu.Unlock()
+
+	// 自动逻辑先尝试平仓释放保证金，再开新仓，避免仓位上限被旧仓位卡住。
+	if cfg.AutoClose {
+		s.autoClosePositions(cfg, now)
+	}
+	if cfg.AutoOpen {
+		s.autoOpenOpportunities(opps, cfg, minProfitRate, now)
+	}
+}
+
+func (s *cexSpotPerpState) autoOpenOpportunities(opps map[string]*strategy.Opportunity, cfg cexSpotPerpAutomationConfig, minProfitRate float64, now int64) {
+	maxOpen := cfg.MaxOpenPositions
+	if maxOpen <= 0 {
+		maxOpen = 1
+	}
+	openKeys := make(map[string]bool)
+	openHedgeKeys := make(map[string]bool)
+	openCount := 0
+	for _, pos := range s.simulator.Positions() {
+		if pos == nil || pos.Status != "open" || pos.Opportunity == nil {
+			continue
+		}
+		openCount++
+		openKeys[opportunityStableKey(pos.Opportunity)] = true
+		openHedgeKeys[opportunityHedgeKey(pos.Opportunity)] = true
+	}
+	if openCount >= maxOpen {
+		return
+	}
+
+	candidates := make([]*strategy.Opportunity, 0, len(opps))
+	for _, opp := range opps {
+		status, _ := opportunityStatus(opp, minProfitRate)
+		if status != "ready" || opp.ProfitRate < cfg.OpenMinProfitRate || openKeys[opportunityStableKey(opp)] || openHedgeKeys[opportunityHedgeKey(opp)] {
+			continue
+		}
+		candidates = append(candidates, opp)
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].NetProfit > candidates[j].NetProfit
+	})
+
+	for _, opp := range candidates {
+		if openCount >= maxOpen {
+			return
+		}
+		pos, err := s.simulator.ExecuteOpportunity(opp)
+		if err != nil {
+			s.recordAutoError(err)
+			s.markOpportunityRejected(opp, err.Error())
+			continue
+		}
+		openCount++
+		s.persistSimState()
+		s.recordAutoOpen(opp, pos, now)
+	}
+}
+
+func (s *cexSpotPerpState) autoClosePositions(cfg cexSpotPerpAutomationConfig, now int64) {
+	for _, pos := range s.simulator.Positions() {
+		if pos == nil || pos.Status != "open" || pos.Opportunity == nil {
+			continue
+		}
+		reason := ""
+		holdMillis := now - pos.OpenedAt
+		if cfg.MaxHoldSeconds > 0 && holdMillis >= cfg.MaxHoldSeconds*1000 {
+			reason = fmt.Sprintf("自动平仓：持仓超过 %d 秒", cfg.MaxHoldSeconds)
+		}
+		if reason == "" && cfg.CloseMinProfitRate > 0 && pos.Opportunity.ProfitRate >= cfg.CloseMinProfitRate {
+			reason = fmt.Sprintf("自动平仓：预计收益率 %.4f%% 达到 %.4f%%", pos.Opportunity.ProfitRate, cfg.CloseMinProfitRate)
+		}
+		if reason == "" {
+			continue
+		}
+		if _, err := s.simulator.ClosePosition(pos.ID, reason); err != nil {
+			s.recordAutoError(err)
+			continue
+		}
+		s.persistSimState()
+		s.recordAutoClose(pos, reason, now)
+	}
+}
+
+func (s *cexSpotPerpState) recordAutoOpen(opp *strategy.Opportunity, pos *strategy.SimArbitragePosition, now int64) {
+	positionID := ""
+	if pos != nil {
+		positionID = pos.ID
+	}
+	key := opportunityStableKey(opp)
+	quantity, notional, margin, spotValue, capitalUsed := autoTradeCapitalFields(pos, opp)
+	trade := cexSpotPerpAutoTrade{
+		ID:           fmt.Sprintf("auto-open-%d-%s", now, persistenceIDPart(key)),
+		PositionID:   positionID,
+		Opportunity:  opp.ID,
+		Symbol:       opp.Symbol,
+		Direction:    opp.Direction,
+		SpotExchange: opp.SpotExchange,
+		PerpExchange: opp.PerpExchange,
+		Action:       "open",
+		Reason:       "自动开仓：机会达到开仓阈值",
+		Quantity:     quantity,
+		Notional:     notional,
+		Margin:       margin,
+		SpotValue:    spotValue,
+		CapitalUsed:  capitalUsed,
+		Profit:       opp.NetProfit,
+		ProfitRate:   opp.ProfitRate,
+		CreatedAt:    now,
+	}
+	var logSnapshot *cexSpotPerpOpportunityLog
+	s.mu.Lock()
+	s.autoTrades = append(s.autoTrades, trade)
+	s.applyAutoTradeStatsLocked(trade)
+	s.autoStats.LastActionAt = now
+	s.autoStats.LastActionError = ""
+	if log := s.opportunityLogs[key]; log != nil {
+		log.AutoOpenedCount++
+		log.AutoRejectedNote = ""
+		copied := *log
+		logSnapshot = &copied
+	}
+	s.mu.Unlock()
+	persistCEXSpotPerpAutoTrade(trade)
+	if logSnapshot != nil {
+		persistCEXSpotPerpOpportunityLog(*logSnapshot)
+	}
+}
+
+func (s *cexSpotPerpState) recordAutoClose(pos *strategy.SimArbitragePosition, reason string, now int64) {
+	opp := pos.Opportunity
+	profit := opp.NetProfit
+	quantity, notional, margin, spotValue, capitalUsed := autoTradeCapitalFields(pos, opp)
+	trade := cexSpotPerpAutoTrade{
+		ID:           fmt.Sprintf("auto-close-%d-%s", now, persistenceIDPart(pos.ID)),
+		PositionID:   pos.ID,
+		Opportunity:  opp.ID,
+		Symbol:       opp.Symbol,
+		Direction:    opp.Direction,
+		SpotExchange: opp.SpotExchange,
+		PerpExchange: opp.PerpExchange,
+		Action:       "close",
+		Reason:       reason,
+		Quantity:     quantity,
+		Notional:     notional,
+		Margin:       margin,
+		SpotValue:    spotValue,
+		CapitalUsed:  capitalUsed,
+		Profit:       profit,
+		ProfitRate:   opp.ProfitRate,
+		CreatedAt:    now,
+	}
+	s.mu.Lock()
+	s.autoTrades = append(s.autoTrades, trade)
+	s.applyAutoTradeStatsLocked(trade)
+	s.autoStats.LastActionAt = now
+	s.autoStats.LastActionError = ""
+	s.mu.Unlock()
+	persistCEXSpotPerpAutoTrade(trade)
+}
+
+func autoTradeCapitalFields(pos *strategy.SimArbitragePosition, opp *strategy.Opportunity) (float64, float64, float64, float64, float64) {
+	if opp == nil {
+		return 0, 0, 0, 0, 0
+	}
+	quantity := spotPerpQuantityFromOpportunity(opp)
+	notional := opp.Notional
+	margin := 0.0
+	if pos != nil {
+		if pos.Notional > 0 {
+			notional = pos.Notional
+		}
+		margin = pos.Margin
+	}
+	spotValue := quantity * opp.PriceA
+	if spotValue <= 0 {
+		spotValue = notional
+	}
+	// 这里记录的是资金足迹，不是单纯现金流。
+	// 正向策略是现货买入价值 + 合约保证金；反向策略是库存占用价值 + 合约保证金。
+	capitalUsed := spotValue + margin
+	return quantity, notional, margin, spotValue, capitalUsed
+}
+
+func (s *cexSpotPerpState) applyAutoTradeStatsLocked(trade cexSpotPerpAutoTrade) {
+	if trade.CreatedAt > s.autoStats.LastActionAt {
+		s.autoStats.LastActionAt = trade.CreatedAt
+	}
+	if trade.Action == "open" {
+		s.autoStats.AutoOpenCount++
+		return
+	}
+	if trade.Action != "close" {
+		return
+	}
+	s.autoStats.AutoCloseCount++
+	if trade.Profit >= 0 {
+		s.autoStats.WinCount++
+	} else {
+		s.autoStats.LossCount++
+	}
+	s.autoStats.TotalProfit += trade.Profit
+	if s.autoStats.AutoCloseCount > 0 {
+		s.autoStats.AverageProfit = s.autoStats.TotalProfit / float64(s.autoStats.AutoCloseCount)
+		s.autoStats.WinRate = float64(s.autoStats.WinCount) / float64(s.autoStats.AutoCloseCount) * 100
+	}
+}
+
+func (s *cexSpotPerpState) recordAutoError(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.autoStats.LastActionAt = time.Now().UnixMilli()
+	s.autoStats.LastActionError = err.Error()
+}
+
+func (s *cexSpotPerpState) markOpportunityRejected(opp *strategy.Opportunity, note string) {
+	key := opportunityStableKey(opp)
+	var snapshot *cexSpotPerpOpportunityLog
+	s.mu.Lock()
+	if log := s.opportunityLogs[key]; log != nil {
+		log.AutoRejectedNote = note
+		copied := *log
+		snapshot = &copied
+	}
+	s.mu.Unlock()
+	if snapshot != nil {
+		persistCEXSpotPerpOpportunityLog(*snapshot)
 	}
 }
 
@@ -983,6 +1859,37 @@ func GetCEXSpotPerpSimulation(c *gin.Context) {
 	c.JSON(http.StatusOK, cexSpotPerpSim.snapshot())
 }
 
+func UpdateCEXSpotPerpAutomation(c *gin.Context) {
+	var req cexSpotPerpAutomationConfig
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.OpenMinProfitRate < 0 || req.CloseMinProfitRate < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "profit rate thresholds cannot be negative"})
+		return
+	}
+	if req.MaxOpenPositions <= 0 {
+		req.MaxOpenPositions = 1
+	}
+	if req.MaxOpenPositions > 20 {
+		req.MaxOpenPositions = 20
+	}
+	if req.CheckIntervalMillis < 500 {
+		req.CheckIntervalMillis = 500
+	}
+	if req.MaxHoldSeconds < 0 {
+		req.MaxHoldSeconds = 0
+	}
+	cexSpotPerpSim.mu.Lock()
+	cexSpotPerpSim.automation = req
+	cexSpotPerpSim.lastAutoCheckAt = 0
+	cexSpotPerpSim.autoStats.LastActionError = ""
+	cexSpotPerpSim.mu.Unlock()
+	cexSpotPerpSim.persistAutomationSetting()
+	c.JSON(http.StatusOK, cexSpotPerpSim.snapshot())
+}
+
 func UpdateCEXSpotPerpConfig(c *gin.Context) {
 	var req cexSpotPerpConfigRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -1050,6 +1957,7 @@ func UpdateCEXSpotPerpAccount(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	cexSpotPerpSim.persistSimState()
 	c.JSON(http.StatusOK, cexSpotPerpSim.snapshot())
 }
 
@@ -1064,11 +1972,13 @@ func TransferCEXSpotPerpAccount(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	cexSpotPerpSim.persistSimState()
 	c.JSON(http.StatusOK, cexSpotPerpSim.snapshot())
 }
 
 func ResetCEXSpotPerpAccounts(c *gin.Context) {
 	cexSpotPerpSim.simulator.ResetAccounts(defaultCEXSpotPerpAccounts())
+	cexSpotPerpSim.persistSimState()
 	c.JSON(http.StatusOK, cexSpotPerpSim.snapshot())
 }
 
@@ -1155,6 +2065,7 @@ func ExecuteCEXSpotPerpOpportunity(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	cexSpotPerpSim.persistSimState()
 	c.JSON(http.StatusOK, cexSpotPerpSim.snapshot())
 }
 
@@ -1171,6 +2082,7 @@ func CloseCEXSpotPerpPosition(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	cexSpotPerpSim.persistSimState()
 	c.JSON(http.StatusOK, cexSpotPerpSim.snapshot())
 }
 

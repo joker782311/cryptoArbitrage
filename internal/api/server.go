@@ -81,6 +81,7 @@ func NewServer() *Server {
 		// 跨所期现模拟盘
 		v1.GET("/cex-spot-perp", handlers.GetCEXSpotPerpSimulation)
 		v1.PUT("/cex-spot-perp/config", handlers.UpdateCEXSpotPerpConfig)
+		v1.PUT("/cex-spot-perp/automation", handlers.UpdateCEXSpotPerpAutomation)
 		v1.PUT("/cex-spot-perp/accounts/:exchange", handlers.UpdateCEXSpotPerpAccount)
 		v1.POST("/cex-spot-perp/accounts/:exchange/transfer", handlers.TransferCEXSpotPerpAccount)
 		v1.POST("/cex-spot-perp/accounts/reset", handlers.ResetCEXSpotPerpAccounts)

@@ -22,6 +22,13 @@ const (
 	MarketTypePerp = "perp"
 )
 
+var defaultCEXSpotPerpSymbols = []string{
+	"BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
+	"DOGEUSDT", "ADAUSDT", "TRXUSDT", "LINKUSDT", "AVAXUSDT",
+	"TONUSDT", "SHIBUSDT", "DOTUSDT", "BCHUSDT", "LTCUSDT",
+	"UNIUSDT", "NEARUSDT", "APTUSDT", "ICPUSDT", "ETCUSDT",
+}
+
 var (
 	ErrSimAccountNotFound          = errors.New("sim account not found")
 	ErrSimInsufficientUSDT         = errors.New("insufficient simulated USDT")
@@ -75,13 +82,14 @@ type CEXSpotPerpConfig struct {
 
 // DefaultCEXSpotPerpConfig 给出保守的模拟盘默认值，避免没有配置时过度高估收益。
 func DefaultCEXSpotPerpConfig() CEXSpotPerpConfig {
+	symbols := append([]string(nil), defaultCEXSpotPerpSymbols...)
 	return CEXSpotPerpConfig{
-		Symbols:   []string{"BTCUSDT", "ETHUSDT", "SOLUSDT"},
+		Symbols:   symbols,
 		Exchanges: []string{"binance", "okx", "bitget"},
 		ExchangeSymbols: map[string][]string{
-			"binance": {"BTCUSDT", "ETHUSDT", "SOLUSDT"},
-			"okx":     {"BTCUSDT", "ETHUSDT", "SOLUSDT"},
-			"bitget":  {"BTCUSDT", "ETHUSDT", "SOLUSDT"},
+			"binance": append([]string(nil), symbols...),
+			"okx":     append([]string(nil), symbols...),
+			"bitget":  append([]string(nil), symbols...),
 		},
 		NotionalUSDT:           1000,
 		MinNetProfitRate:       0.2,
@@ -609,6 +617,32 @@ func (s *CEXSpotPerpSimulator) ResetAccounts(accounts map[string]*SimAccount) {
 	s.haltReason = ""
 }
 
+func (s *CEXSpotPerpSimulator) RestoreState(accounts map[string]*SimAccount, positions []*SimArbitragePosition) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.accounts = make(map[string]*SimAccount, len(accounts))
+	for name, account := range accounts {
+		s.accounts[name] = cloneSimAccount(account)
+	}
+	s.positions = make(map[string]*SimArbitragePosition, len(positions))
+	for _, pos := range positions {
+		if pos == nil || pos.ID == "" {
+			continue
+		}
+		copyPos := *pos
+		if pos.Opportunity != nil {
+			opp := *pos.Opportunity
+			opp.Legs = append([]Leg(nil), pos.Opportunity.Legs...)
+			copyPos.Opportunity = &opp
+		}
+		copyPos.Trades = append([]SimTrade(nil), pos.Trades...)
+		s.positions[copyPos.ID] = &copyPos
+	}
+	s.closeActions = nil
+	s.halted = false
+	s.haltReason = ""
+}
+
 func (s *CEXSpotPerpSimulator) Positions() []*SimArbitragePosition {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -666,6 +700,26 @@ func (s *CEXSpotPerpSimulator) Resume() {
 	s.haltReason = ""
 }
 
+func (s *CEXSpotPerpSimulator) reservedSpotInventoryLocked(exchangeName, baseAsset string) float64 {
+	var reserved float64
+	for _, pos := range s.positions {
+		if pos == nil || pos.Status != "open" || pos.Opportunity == nil {
+			continue
+		}
+		opp := pos.Opportunity
+		if opp.Direction != DirectionSpotLongPerpShort || opp.SpotExchange != exchangeName {
+			continue
+		}
+		if baseAssetFromSymbol(opp.Symbol) != baseAsset {
+			continue
+		}
+		// 买现货 + 空永续中的现货是当前套利组合的对冲腿，
+		// 平仓前不能再被第二阶段“卖库存 + 多永续”重复使用。
+		reserved += spotPerpQuantity(opp)
+	}
+	return reserved
+}
+
 func (s *CEXSpotPerpSimulator) ExecuteOpportunity(opp *Opportunity) (*SimArbitragePosition, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -710,7 +764,8 @@ func (s *CEXSpotPerpSimulator) ExecuteOpportunity(opp *Opportunity) (*SimArbitra
 		perpAccount.FrozenUSDT += margin
 		perpAccount.PerpPositions[opp.Symbol] -= quantity
 	case DirectionSpotShortInventoryPerpLong:
-		if spotAccount.SpotBalances[baseAsset]+1e-12 < quantity {
+		availableInventory := spotAccount.SpotBalances[baseAsset] - s.reservedSpotInventoryLocked(opp.SpotExchange, baseAsset)
+		if availableInventory+1e-12 < quantity {
 			return nil, ErrSimInsufficientInventory
 		}
 		if perpAccount.PerpUSDT-perpAccount.FrozenUSDT < margin+perpFee {

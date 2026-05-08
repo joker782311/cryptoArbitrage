@@ -89,6 +89,76 @@ export interface CloseAction {
   createdAt: number
 }
 
+export interface SpotPerpAutomation {
+  enabled: boolean
+  autoOpen: boolean
+  autoClose: boolean
+  openMinProfitRate: number
+  closeMinProfitRate: number
+  maxHoldSeconds: number
+  maxOpenPositions: number
+  checkIntervalMillis: number
+}
+
+export interface SpotPerpAutoStats {
+  autoOpenCount: number
+  autoCloseCount: number
+  winCount: number
+  lossCount: number
+  totalProfit: number
+  averageProfit: number
+  winRate: number
+  lastActionAt: number
+  lastActionError: string
+}
+
+export interface OpportunityLog {
+  key: string
+  id: string
+  symbol: string
+  direction: SpotPerpDirection
+  spotExchange: string
+  perpExchange: string
+  firstSeenAt: number
+  lastSeenAt: number
+  seenCount: number
+  bestProfit: number
+  bestProfitRate: number
+  lastProfit: number
+  lastProfitRate: number
+  lastStatus: 'ready' | 'watch' | 'blocked'
+  lastBlockReason: string
+  autoOpenedCount: number
+  autoRejectedNote: string
+}
+
+export interface AutoTrade {
+  id: string
+  positionId: string
+  opportunity: string
+  symbol: string
+  direction: SpotPerpDirection
+  spotExchange: string
+  perpExchange: string
+  action: 'open' | 'close'
+  reason: string
+  quantity: number
+  notional: number
+  margin: number
+  spotValue: number
+  capitalUsed: number
+  profit: number
+  profitRate: number
+  createdAt: number
+}
+
+const defaultTopSymbols = [
+  'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT',
+  'DOGEUSDT', 'ADAUSDT', 'TRXUSDT', 'LINKUSDT', 'AVAXUSDT',
+  'TONUSDT', 'SHIBUSDT', 'DOTUSDT', 'BCHUSDT', 'LTCUSDT',
+  'UNIUSDT', 'NEARUSDT', 'APTUSDT', 'ICPUSDT', 'ETCUSDT',
+]
+
 interface SimulationSnapshot {
   status: MarketStatus
   haltReason: string
@@ -102,6 +172,10 @@ interface SimulationSnapshot {
   opportunities: SpotPerpOpportunity[]
   positions: SimPosition[]
   closeActions: CloseAction[]
+  opportunityLogs: OpportunityLog[]
+  autoTrades: AutoTrade[]
+  automation: SpotPerpAutomation
+  autoStats: SpotPerpAutoStats
   pnl: {
     realizedPnL: number
     unrealizedPnL: number
@@ -116,12 +190,12 @@ export const useCexSpotPerpStore = defineStore('cexSpotPerp', () => {
   const status = ref<MarketStatus>('running')
   const haltReason = ref('')
   const config = ref<SpotPerpConfig>({
-    symbols: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'],
+    symbols: [...defaultTopSymbols],
     exchanges: ['binance', 'okx', 'bitget'],
     exchangeSymbols: {
-      binance: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'],
-      okx: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'],
-      bitget: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'],
+      binance: [...defaultTopSymbols],
+      okx: [...defaultTopSymbols],
+      bitget: [...defaultTopSymbols],
     },
     leverage: 3,
     maxLeverage: 3,
@@ -133,6 +207,29 @@ export const useCexSpotPerpStore = defineStore('cexSpotPerp', () => {
   const opportunities = ref<SpotPerpOpportunity[]>([])
   const positions = ref<SimPosition[]>([])
   const closeActions = ref<CloseAction[]>([])
+  const opportunityLogs = ref<OpportunityLog[]>([])
+  const autoTrades = ref<AutoTrade[]>([])
+  const automation = ref<SpotPerpAutomation>({
+    enabled: false,
+    autoOpen: true,
+    autoClose: true,
+    openMinProfitRate: 0.05,
+    closeMinProfitRate: 0,
+    maxHoldSeconds: 300,
+    maxOpenPositions: 3,
+    checkIntervalMillis: 1000,
+  })
+  const autoStats = ref<SpotPerpAutoStats>({
+    autoOpenCount: 0,
+    autoCloseCount: 0,
+    winCount: 0,
+    lossCount: 0,
+    totalProfit: 0,
+    averageProfit: 0,
+    winRate: 0,
+    lastActionAt: 0,
+    lastActionError: '',
+  })
   const lastQuoteAt = ref(0)
   const marketErrors = ref<Record<string, string>>({})
   const wsStatus = ref<Record<string, string>>({})
@@ -162,6 +259,10 @@ export const useCexSpotPerpStore = defineStore('cexSpotPerp', () => {
     opportunities.value = snapshot.opportunities || []
     positions.value = snapshot.positions || []
     closeActions.value = snapshot.closeActions || []
+    opportunityLogs.value = snapshot.opportunityLogs || []
+    autoTrades.value = snapshot.autoTrades || []
+    automation.value = snapshot.automation || automation.value
+    autoStats.value = snapshot.autoStats || autoStats.value
     lastQuoteAt.value = snapshot.lastQuoteAt || 0
     marketErrors.value = snapshot.marketErrors || {}
     wsStatus.value = snapshot.wsStatus || {}
@@ -244,6 +345,11 @@ export const useCexSpotPerpStore = defineStore('cexSpotPerp', () => {
     hydrate(response)
   }
 
+  async function updateAutomation(nextAutomation: SpotPerpAutomation) {
+    const response = await api.put('/cex-spot-perp/automation', nextAutomation) as unknown as SimulationSnapshot
+    hydrate(response)
+  }
+
   async function updateAccount(account: SimAccount) {
     const response = await api.put(`/cex-spot-perp/accounts/${encodeURIComponent(account.exchange)}`, {
       usdt: account.usdt,
@@ -278,6 +384,10 @@ export const useCexSpotPerpStore = defineStore('cexSpotPerp', () => {
     opportunities,
     positions,
     closeActions,
+    opportunityLogs,
+    autoTrades,
+    automation,
+    autoStats,
     lastQuoteAt,
     marketErrors,
     wsStatus,
@@ -297,6 +407,7 @@ export const useCexSpotPerpStore = defineStore('cexSpotPerp', () => {
     triggerCircuitBreaker,
     resumeSimulation,
     updateConfig,
+    updateAutomation,
     updateAccount,
     transferAccountUSDT,
     resetAccounts,

@@ -149,6 +149,54 @@ func TestCEXSpotPerp_SimulatorRequiresInventoryForReverse(t *testing.T) {
 	assert.True(t, errors.Is(err, strategy.ErrSimInsufficientInventory))
 }
 
+func TestCEXSpotPerp_SimulatorDoesNotReuseHedgedSpotInventory(t *testing.T) {
+	longOpp := &strategy.Opportunity{
+		ID:           "opp-long",
+		StrategyType: strategy.StrategyTypeCEXSpotPerp,
+		Direction:    strategy.DirectionSpotLongPerpShort,
+		Notional:     1000,
+		NetProfit:    10,
+		SpotExchange: "binance",
+		PerpExchange: "okx",
+		Symbol:       "BTCUSDT",
+		PriceA:       10000,
+		PriceB:       10100,
+		FeeCost:      1.5,
+		Legs: []strategy.Leg{
+			{Exchange: "binance", Symbol: "BTCUSDT", Side: "buy", Quantity: 0.1, Price: 10000},
+			{Exchange: "okx", Symbol: "BTCUSDT", Side: "sell", Quantity: 0.1, Price: 10100},
+		},
+	}
+	reverseOpp := &strategy.Opportunity{
+		ID:           "opp-reverse",
+		StrategyType: strategy.StrategyTypeCEXSpotPerp,
+		Direction:    strategy.DirectionSpotShortInventoryPerpLong,
+		Notional:     1000,
+		NetProfit:    8,
+		SpotExchange: "binance",
+		PerpExchange: "okx",
+		Symbol:       "BTCUSDT",
+		PriceA:       10000,
+		PriceB:       9900,
+		FeeCost:      1.5,
+		Legs: []strategy.Leg{
+			{Exchange: "binance", Symbol: "BTCUSDT", Side: "sell", Quantity: 0.1, Price: 10000},
+			{Exchange: "okx", Symbol: "BTCUSDT", Side: "buy", Quantity: 0.1, Price: 9900},
+		},
+	}
+	sim := strategy.NewCEXSpotPerpSimulator(map[string]*strategy.SimAccount{
+		"binance": {Exchange: "binance", USDT: 5000, PerpUSDT: 5000, SpotBalances: map[string]float64{}, PerpPositions: map[string]float64{}},
+		"okx":     {Exchange: "okx", USDT: 5000, PerpUSDT: 5000, SpotBalances: map[string]float64{}, PerpPositions: map[string]float64{}},
+	}, 3)
+
+	_, err := sim.ExecuteOpportunity(longOpp)
+	require.NoError(t, err)
+
+	_, err = sim.ExecuteOpportunity(reverseOpp)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, strategy.ErrSimInsufficientInventory))
+}
+
 func TestCEXSpotPerp_SimulatorExecutesAndCircuitBreakerCreatesCloseActions(t *testing.T) {
 	s := strategy.NewCEXSpotPerpStrategy(testSpotPerpConfig())
 	s.UpdateQuote(strategy.CEXSpotPerpQuote{Exchange: "binance", Symbol: "BTCUSDT", MarketType: strategy.MarketTypeSpot, Bid: 9990, Ask: 10000})
