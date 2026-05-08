@@ -835,6 +835,25 @@ func (s *CEXSpotPerpSimulator) ClosePosition(positionID, reason string) (*SimClo
 	return s.ClosePositionWithMarket(positionID, reason, 0, 0)
 }
 
+func (s *CEXSpotPerpSimulator) EstimateClosePnL(positionID string, closeSpotPrice, closePerpPrice float64) (float64, float64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	pos, ok := s.positions[positionID]
+	if !ok || pos == nil {
+		return 0, 0, ErrSimPositionNotFound
+	}
+	if pos.Status != "open" {
+		return 0, 0, ErrSimPositionNotOpen
+	}
+	pnl := estimateClosePnLLocked(pos, closeSpotPrice, closePerpPrice)
+	rate := 0.0
+	if pos.Notional > 0 {
+		rate = pnl / pos.Notional * 100
+	}
+	return pnl, rate, nil
+}
+
 // ClosePositionWithMarket 执行模拟平仓。平仓价格来自当前盘口估算：
 // 正向组合用现货 bid 卖出、永续 ask 买回；反向组合用现货 ask 买回、永续 bid 卖出。
 // 这能让“预计收益”和“实际收益”分开，后续接实盘时应替换为交易所成交回报。
@@ -868,31 +887,21 @@ func (s *CEXSpotPerpSimulator) ClosePositionWithMarket(positionID, reason string
 	if closePerpPrice <= 0 {
 		closePerpPrice = opp.PriceB
 	}
-	spotOpenFee, perpOpenFee := openingFees(pos)
-	spotCloseFeeRate := feeRateFromTrade(pos, MarketTypeSpot, opp.Notional, 0.001)
-	perpCloseFeeRate := feeRateFromTrade(pos, MarketTypePerp, opp.Notional, 0.0005)
 	spotCloseValue := quantity * closeSpotPrice
 	perpCloseValue := quantity * closePerpPrice
-	spotCloseFee := spotCloseValue * spotCloseFeeRate
-	perpCloseFee := perpCloseValue * perpCloseFeeRate
-	closeSlippage := estimatedCloseSlippage(opp, spotCloseValue+perpCloseValue)
-	fundingPnL := opp.FundingAmount
-	var grossPnL float64
 	switch opp.Direction {
 	case DirectionSpotLongPerpShort:
 		spotAccount.SpotBalances[baseAsset] = math.Max(0, spotAccount.SpotBalances[baseAsset]-quantity)
-		spotAccount.USDT += spotCloseValue - spotCloseFee
+		spotAccount.USDT += spotCloseValue - closeFeeForMarket(pos, MarketTypeSpot, spotCloseValue)
 		perpPnL := (opp.PriceB - closePerpPrice) * quantity
-		perpAccount.PerpUSDT += perpPnL - perpCloseFee
+		perpAccount.PerpUSDT += perpPnL - closeFeeForMarket(pos, MarketTypePerp, perpCloseValue)
 		perpAccount.PerpPositions[opp.Symbol] += quantity
-		grossPnL = (closeSpotPrice-opp.PriceA)*quantity + perpPnL + fundingPnL
 	case DirectionSpotShortInventoryPerpLong:
-		spotAccount.USDT = math.Max(0, spotAccount.USDT-spotCloseValue-spotCloseFee)
+		spotAccount.USDT = math.Max(0, spotAccount.USDT-spotCloseValue-closeFeeForMarket(pos, MarketTypeSpot, spotCloseValue))
 		spotAccount.SpotBalances[baseAsset] += quantity
 		perpPnL := (closePerpPrice - opp.PriceB) * quantity
-		perpAccount.PerpUSDT += perpPnL - perpCloseFee
+		perpAccount.PerpUSDT += perpPnL - closeFeeForMarket(pos, MarketTypePerp, perpCloseValue)
 		perpAccount.PerpPositions[opp.Symbol] -= quantity
-		grossPnL = (opp.PriceA-closeSpotPrice)*quantity + perpPnL + fundingPnL
 	default:
 		return nil, ErrSimUnsupportedDirection
 	}
@@ -900,7 +909,7 @@ func (s *CEXSpotPerpSimulator) ClosePositionWithMarket(positionID, reason string
 	perpAccount.FrozenUSDT = math.Max(0, perpAccount.FrozenUSDT-pos.Margin)
 	pos.Status = "closed"
 	pos.ClosedAt = time.Now().UnixMilli()
-	pos.RealizedPnL = grossPnL - spotOpenFee - perpOpenFee - spotCloseFee - perpCloseFee - closeSlippage
+	pos.RealizedPnL = estimateClosePnLLocked(pos, closeSpotPrice, closePerpPrice)
 
 	action := SimCloseAction{
 		PositionID: pos.ID,
@@ -972,6 +981,51 @@ func openingFees(pos *SimArbitragePosition) (float64, float64) {
 		}
 	}
 	return spotFee, perpFee
+}
+
+func estimateClosePnLLocked(pos *SimArbitragePosition, closeSpotPrice, closePerpPrice float64) float64 {
+	if pos == nil || pos.Opportunity == nil {
+		return 0
+	}
+	opp := pos.Opportunity
+	if closeSpotPrice <= 0 {
+		closeSpotPrice = opp.PriceA
+	}
+	if closePerpPrice <= 0 {
+		closePerpPrice = opp.PriceB
+	}
+	quantity := spotPerpQuantity(opp)
+	spotOpenFee, perpOpenFee := openingFees(pos)
+	spotCloseValue := quantity * closeSpotPrice
+	perpCloseValue := quantity * closePerpPrice
+	spotCloseFee := closeFeeForMarket(pos, MarketTypeSpot, spotCloseValue)
+	perpCloseFee := closeFeeForMarket(pos, MarketTypePerp, perpCloseValue)
+	closeSlippage := estimatedCloseSlippage(opp, spotCloseValue+perpCloseValue)
+	fundingPnL := opp.FundingAmount
+
+	var grossPnL float64
+	switch opp.Direction {
+	case DirectionSpotLongPerpShort:
+		perpPnL := (opp.PriceB - closePerpPrice) * quantity
+		grossPnL = (closeSpotPrice-opp.PriceA)*quantity + perpPnL + fundingPnL
+	case DirectionSpotShortInventoryPerpLong:
+		perpPnL := (closePerpPrice - opp.PriceB) * quantity
+		grossPnL = (opp.PriceA-closeSpotPrice)*quantity + perpPnL + fundingPnL
+	default:
+		return 0
+	}
+	return grossPnL - spotOpenFee - perpOpenFee - spotCloseFee - perpCloseFee - closeSlippage
+}
+
+func closeFeeForMarket(pos *SimArbitragePosition, market string, closeValue float64) float64 {
+	if pos == nil || pos.Opportunity == nil || closeValue <= 0 {
+		return 0
+	}
+	fallbackRate := 0.0005
+	if market == MarketTypeSpot {
+		fallbackRate = 0.001
+	}
+	return closeValue * feeRateFromTrade(pos, market, pos.Opportunity.Notional, fallbackRate)
 }
 
 func feeRateFromTrade(pos *SimArbitragePosition, market string, fallbackNotional, fallbackRate float64) float64 {

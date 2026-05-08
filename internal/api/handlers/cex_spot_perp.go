@@ -1618,8 +1618,11 @@ func (s *cexSpotPerpState) autoClosePositions(cfg cexSpotPerpAutomationConfig, n
 		if cfg.MaxHoldSeconds > 0 && holdMillis >= cfg.MaxHoldSeconds*1000 {
 			reason = fmt.Sprintf("自动平仓：持仓超过 %d 秒", cfg.MaxHoldSeconds)
 		}
-		if reason == "" && cfg.CloseMinProfitRate > 0 && pos.Opportunity.ProfitRate >= cfg.CloseMinProfitRate {
-			reason = fmt.Sprintf("自动平仓：预计收益率 %.4f%% 达到 %.4f%%", pos.Opportunity.ProfitRate, cfg.CloseMinProfitRate)
+		if reason == "" && cfg.CloseMinProfitRate > 0 {
+			_, currentProfitRate, ok := s.estimatePositionClosePnL(pos)
+			if ok && currentProfitRate >= cfg.CloseMinProfitRate {
+				reason = fmt.Sprintf("自动平仓：当前预计平仓收益率 %.4f%% 达到 %.4f%%", currentProfitRate, cfg.CloseMinProfitRate)
+			}
 		}
 		if reason == "" {
 			continue
@@ -1632,6 +1635,21 @@ func (s *cexSpotPerpState) autoClosePositions(cfg cexSpotPerpAutomationConfig, n
 		s.persistSimState()
 		s.recordAutoClose(closedPos, reason, now)
 	}
+}
+
+func (s *cexSpotPerpState) estimatePositionClosePnL(pos *strategy.SimArbitragePosition) (float64, float64, bool) {
+	if pos == nil || pos.Opportunity == nil {
+		return 0, 0, false
+	}
+	closeSpotPrice, closePerpPrice, ok := s.strategy.ClosePrices(pos.Opportunity.Symbol, pos.Opportunity.SpotExchange, pos.Opportunity.PerpExchange, pos.Opportunity.Direction)
+	if !ok {
+		return 0, 0, false
+	}
+	pnl, rate, err := s.simulator.EstimateClosePnL(pos.ID, closeSpotPrice, closePerpPrice)
+	if err != nil {
+		return 0, 0, false
+	}
+	return pnl, rate, true
 }
 
 func (s *cexSpotPerpState) closePositionWithCurrentMarket(positionID, reason string) (*strategy.SimArbitragePosition, error) {
