@@ -369,7 +369,7 @@
           <el-table-column label="资金占用" min-width="130">
             <template #default="{ row }">{{ money(row.capitalUsed) }}</template>
           </el-table-column>
-          <el-table-column label="利润" min-width="130">
+          <el-table-column label="预计/实际利润" min-width="150">
             <template #default="{ row }">{{ signedMoney(row.profit) }} / {{ row.profitRate.toFixed(2) }}%</template>
           </el-table-column>
           <el-table-column prop="reason" label="原因" min-width="260" />

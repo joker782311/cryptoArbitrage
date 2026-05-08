@@ -238,6 +238,24 @@ func (s *CEXSpotPerpStrategy) QuoteStatuses() []CEXSpotPerpQuoteStatus {
 	return statuses
 }
 
+func (s *CEXSpotPerpStrategy) ClosePrices(symbol, spotExchange, perpExchange, direction string) (float64, float64, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	spot, spotOK := s.spotQuotes[spotExchange][symbol]
+	perp, perpOK := s.perpQuotes[perpExchange][symbol]
+	if !spotOK || !perpOK || s.isQuoteStale(spot) || s.isQuoteStale(perp) {
+		return 0, 0, false
+	}
+	switch direction {
+	case DirectionSpotLongPerpShort:
+		return spot.Bid, perp.Ask, spot.Bid > 0 && perp.Ask > 0
+	case DirectionSpotShortInventoryPerpLong:
+		return spot.Ask, perp.Bid, spot.Ask > 0 && perp.Bid > 0
+	default:
+		return 0, 0, false
+	}
+}
+
 func (s *CEXSpotPerpStrategy) scanSymbol(symbol string, enforceMinProfit bool) []*Opportunity {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -654,6 +672,23 @@ func (s *CEXSpotPerpSimulator) Positions() []*SimArbitragePosition {
 	return result
 }
 
+func (s *CEXSpotPerpSimulator) Position(positionID string) (*SimArbitragePosition, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	pos, ok := s.positions[positionID]
+	if !ok || pos == nil {
+		return nil, false
+	}
+	copyPos := *pos
+	if pos.Opportunity != nil {
+		opp := *pos.Opportunity
+		opp.Legs = append([]Leg(nil), pos.Opportunity.Legs...)
+		copyPos.Opportunity = &opp
+	}
+	copyPos.Trades = append([]SimTrade(nil), pos.Trades...)
+	return &copyPos, true
+}
+
 func (s *CEXSpotPerpSimulator) PnLSummary() map[string]float64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -796,9 +831,14 @@ func (s *CEXSpotPerpSimulator) ExecuteOpportunity(opp *Opportunity) (*SimArbitra
 	return position, nil
 }
 
-// ClosePosition 执行普通模拟平仓。这里按开仓价反向平掉两条腿，
-// 重点验证账户释放、库存回补和持仓状态流转；真实盘必须改用实时盘口或真实成交回报。
 func (s *CEXSpotPerpSimulator) ClosePosition(positionID, reason string) (*SimCloseAction, error) {
+	return s.ClosePositionWithMarket(positionID, reason, 0, 0)
+}
+
+// ClosePositionWithMarket 执行模拟平仓。平仓价格来自当前盘口估算：
+// 正向组合用现货 bid 卖出、永续 ask 买回；反向组合用现货 ask 买回、永续 bid 卖出。
+// 这能让“预计收益”和“实际收益”分开，后续接实盘时应替换为交易所成交回报。
+func (s *CEXSpotPerpSimulator) ClosePositionWithMarket(positionID, reason string, closeSpotPrice, closePerpPrice float64) (*SimCloseAction, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -822,15 +862,37 @@ func (s *CEXSpotPerpSimulator) ClosePosition(positionID, reason string) (*SimClo
 
 	quantity := spotPerpQuantity(opp)
 	baseAsset := baseAssetFromSymbol(opp.Symbol)
+	if closeSpotPrice <= 0 {
+		closeSpotPrice = opp.PriceA
+	}
+	if closePerpPrice <= 0 {
+		closePerpPrice = opp.PriceB
+	}
+	spotOpenFee, perpOpenFee := openingFees(pos)
+	spotCloseFeeRate := feeRateFromTrade(pos, MarketTypeSpot, opp.Notional, 0.001)
+	perpCloseFeeRate := feeRateFromTrade(pos, MarketTypePerp, opp.Notional, 0.0005)
+	spotCloseValue := quantity * closeSpotPrice
+	perpCloseValue := quantity * closePerpPrice
+	spotCloseFee := spotCloseValue * spotCloseFeeRate
+	perpCloseFee := perpCloseValue * perpCloseFeeRate
+	closeSlippage := estimatedCloseSlippage(opp, spotCloseValue+perpCloseValue)
+	fundingPnL := opp.FundingAmount
+	var grossPnL float64
 	switch opp.Direction {
 	case DirectionSpotLongPerpShort:
 		spotAccount.SpotBalances[baseAsset] = math.Max(0, spotAccount.SpotBalances[baseAsset]-quantity)
-		spotAccount.USDT += quantity * opp.PriceA
+		spotAccount.USDT += spotCloseValue - spotCloseFee
+		perpPnL := (opp.PriceB - closePerpPrice) * quantity
+		perpAccount.PerpUSDT += perpPnL - perpCloseFee
 		perpAccount.PerpPositions[opp.Symbol] += quantity
+		grossPnL = (closeSpotPrice-opp.PriceA)*quantity + perpPnL + fundingPnL
 	case DirectionSpotShortInventoryPerpLong:
-		spotAccount.USDT = math.Max(0, spotAccount.USDT-quantity*opp.PriceA)
+		spotAccount.USDT = math.Max(0, spotAccount.USDT-spotCloseValue-spotCloseFee)
 		spotAccount.SpotBalances[baseAsset] += quantity
+		perpPnL := (closePerpPrice - opp.PriceB) * quantity
+		perpAccount.PerpUSDT += perpPnL - perpCloseFee
 		perpAccount.PerpPositions[opp.Symbol] -= quantity
+		grossPnL = (opp.PriceA-closeSpotPrice)*quantity + perpPnL + fundingPnL
 	default:
 		return nil, ErrSimUnsupportedDirection
 	}
@@ -838,9 +900,7 @@ func (s *CEXSpotPerpSimulator) ClosePosition(positionID, reason string) (*SimClo
 	perpAccount.FrozenUSDT = math.Max(0, perpAccount.FrozenUSDT-pos.Margin)
 	pos.Status = "closed"
 	pos.ClosedAt = time.Now().UnixMilli()
-	// 第一版模拟盘没有实时平仓盘口，先把开仓时估算的净收益作为已实现收益。
-	// 后续接订单簿或真实成交回报时，应在这里改成真实平仓盈亏。
-	pos.RealizedPnL = opp.NetProfit
+	pos.RealizedPnL = grossPnL - spotOpenFee - perpOpenFee - spotCloseFee - perpCloseFee - closeSlippage
 
 	action := SimCloseAction{
 		PositionID: pos.ID,
@@ -896,6 +956,47 @@ func closeLegsForOpportunity(opp *Opportunity) []Leg {
 	default:
 		return nil
 	}
+}
+
+func openingFees(pos *SimArbitragePosition) (float64, float64) {
+	var spotFee, perpFee float64
+	if pos == nil {
+		return 0, 0
+	}
+	for _, trade := range pos.Trades {
+		switch trade.Market {
+		case MarketTypeSpot:
+			spotFee += trade.Fee
+		case MarketTypePerp:
+			perpFee += trade.Fee
+		}
+	}
+	return spotFee, perpFee
+}
+
+func feeRateFromTrade(pos *SimArbitragePosition, market string, fallbackNotional, fallbackRate float64) float64 {
+	if pos != nil {
+		for _, trade := range pos.Trades {
+			if trade.Market != market {
+				continue
+			}
+			value := math.Abs(trade.Quantity * trade.Price)
+			if value > 0 && trade.Fee > 0 {
+				return trade.Fee / value
+			}
+		}
+	}
+	if fallbackNotional > 0 {
+		return fallbackRate
+	}
+	return fallbackRate
+}
+
+func estimatedCloseSlippage(opp *Opportunity, closeValue float64) float64 {
+	if opp == nil || opp.Notional <= 0 || opp.Slippage <= 0 || closeValue <= 0 {
+		return 0
+	}
+	return closeValue * (opp.Slippage / (opp.Notional * 2))
 }
 
 func spotPerpQuantity(opp *Opportunity) float64 {

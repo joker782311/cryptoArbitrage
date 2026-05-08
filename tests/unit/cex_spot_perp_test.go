@@ -238,17 +238,17 @@ func TestCEXSpotPerp_SimulatorClosesPosition(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "open", pos.Status)
 
-	action, err := sim.ClosePosition(pos.ID, "manual close")
+	action, err := sim.ClosePositionWithMarket(pos.ID, "manual close", 10020, 10040)
 	require.NoError(t, err)
 	assert.Equal(t, pos.ID, action.PositionID)
 	assert.Equal(t, "closed", pos.Status)
-	assert.Equal(t, opp.NetProfit, pos.RealizedPnL)
+	assert.NotEqual(t, opp.NetProfit, pos.RealizedPnL)
 
 	account, ok := sim.Account("okx")
 	require.True(t, ok)
 	assert.Equal(t, 0.0, account.FrozenUSDT)
 
 	pnl := sim.PnLSummary()
-	assert.Equal(t, opp.NetProfit, pnl["realizedPnL"])
+	assert.InDelta(t, pos.RealizedPnL, pnl["realizedPnL"], 1e-9)
 	assert.Equal(t, 0.0, pnl["unrealizedPnL"])
 }

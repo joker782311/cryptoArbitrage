@@ -1624,13 +1624,36 @@ func (s *cexSpotPerpState) autoClosePositions(cfg cexSpotPerpAutomationConfig, n
 		if reason == "" {
 			continue
 		}
-		if _, err := s.simulator.ClosePosition(pos.ID, reason); err != nil {
+		closedPos, err := s.closePositionWithCurrentMarket(pos.ID, reason)
+		if err != nil {
 			s.recordAutoError(err)
 			continue
 		}
 		s.persistSimState()
-		s.recordAutoClose(pos, reason, now)
+		s.recordAutoClose(closedPos, reason, now)
 	}
+}
+
+func (s *cexSpotPerpState) closePositionWithCurrentMarket(positionID, reason string) (*strategy.SimArbitragePosition, error) {
+	pos, ok := s.simulator.Position(positionID)
+	if !ok || pos == nil || pos.Opportunity == nil {
+		return nil, strategy.ErrSimPositionNotFound
+	}
+	closeSpotPrice, closePerpPrice, ok := s.strategy.ClosePrices(pos.Opportunity.Symbol, pos.Opportunity.SpotExchange, pos.Opportunity.PerpExchange, pos.Opportunity.Direction)
+	if ok {
+		if _, err := s.simulator.ClosePositionWithMarket(positionID, reason, closeSpotPrice, closePerpPrice); err != nil {
+			return nil, err
+		}
+	} else {
+		if _, err := s.simulator.ClosePosition(positionID, reason); err != nil {
+			return nil, err
+		}
+	}
+	closedPos, ok := s.simulator.Position(positionID)
+	if !ok || closedPos == nil {
+		return nil, strategy.ErrSimPositionNotFound
+	}
+	return closedPos, nil
 }
 
 func (s *cexSpotPerpState) recordAutoOpen(opp *strategy.Opportunity, pos *strategy.SimArbitragePosition, now int64) {
@@ -1680,7 +1703,11 @@ func (s *cexSpotPerpState) recordAutoOpen(opp *strategy.Opportunity, pos *strate
 
 func (s *cexSpotPerpState) recordAutoClose(pos *strategy.SimArbitragePosition, reason string, now int64) {
 	opp := pos.Opportunity
-	profit := opp.NetProfit
+	profit := pos.RealizedPnL
+	profitRate := 0.0
+	if pos.Notional > 0 {
+		profitRate = profit / pos.Notional * 100
+	}
 	quantity, notional, margin, spotValue, capitalUsed := autoTradeCapitalFields(pos, opp)
 	trade := cexSpotPerpAutoTrade{
 		ID:           fmt.Sprintf("auto-close-%d-%s", now, persistenceIDPart(pos.ID)),
@@ -1698,7 +1725,7 @@ func (s *cexSpotPerpState) recordAutoClose(pos *strategy.SimArbitragePosition, r
 		SpotValue:    spotValue,
 		CapitalUsed:  capitalUsed,
 		Profit:       profit,
-		ProfitRate:   opp.ProfitRate,
+		ProfitRate:   profitRate,
 		CreatedAt:    now,
 	}
 	s.mu.Lock()
@@ -2078,7 +2105,7 @@ func CloseCEXSpotPerpPosition(c *gin.Context) {
 	if req.Reason == "" {
 		req.Reason = "手动平仓"
 	}
-	if _, err := cexSpotPerpSim.simulator.ClosePosition(id, req.Reason); err != nil {
+	if _, err := cexSpotPerpSim.closePositionWithCurrentMarket(id, req.Reason); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
