@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,16 +24,21 @@ var cexSpotPerpWSUpgrader = websocket.Upgrader{
 }
 
 type cexSpotPerpState struct {
-	mu            sync.RWMutex
-	strategy      *strategy.CEXSpotPerpStrategy
-	simulator     *strategy.CEXSpotPerpSimulator
-	opportunities map[string]*strategy.Opportunity
-	symbols       []string
-	lastQuoteAt   int64
-	marketErrors  map[string]string
-	wsStatus      map[string]string
-	wsErrors      map[string]string
-	httpClient    *http.Client
+	mu              sync.RWMutex
+	strategy        *strategy.CEXSpotPerpStrategy
+	simulator       *strategy.CEXSpotPerpSimulator
+	opportunities   map[string]*strategy.Opportunity
+	symbols         []string
+	exchanges       []string
+	exchangeSymbols map[string][]string
+	minProfitRate   float64
+	leverage        float64
+	wsGeneration    int64
+	lastQuoteAt     int64
+	marketErrors    map[string]string
+	wsStatus        map[string]string
+	wsErrors        map[string]string
+	httpClient      *http.Client
 }
 
 var cexSpotPerpSim = newCEXSpotPerpState()
@@ -41,6 +47,7 @@ func newCEXSpotPerpState() *cexSpotPerpState {
 	cfg := strategy.DefaultCEXSpotPerpConfig()
 	cfg.NotionalUSDT = 3000
 	cfg.MinNetProfitRate = 0.05
+	cfg.CarryFundingIntervals = 6
 	s := strategy.NewCEXSpotPerpStrategy(cfg)
 
 	// 第一版 API 使用内存模拟盘：行情、资金、持仓都在服务端统一维护，
@@ -58,7 +65,30 @@ func newCEXSpotPerpState() *cexSpotPerpState {
 		s.UpdateQuote(quote)
 	}
 
-	sim := strategy.NewCEXSpotPerpSimulator(map[string]*strategy.SimAccount{
+	sim := strategy.NewCEXSpotPerpSimulator(defaultCEXSpotPerpAccounts(), cfg.DefaultLeverage)
+
+	state := &cexSpotPerpState{
+		strategy:        s,
+		simulator:       sim,
+		opportunities:   make(map[string]*strategy.Opportunity),
+		symbols:         cfg.Symbols,
+		exchanges:       cfg.Exchanges,
+		exchangeSymbols: cloneStringSliceMap(cfg.ExchangeSymbols),
+		minProfitRate:   cfg.MinNetProfitRate,
+		leverage:        cfg.DefaultLeverage,
+		lastQuoteAt:     time.Now().UnixMilli(),
+		marketErrors:    make(map[string]string),
+		wsStatus:        make(map[string]string),
+		wsErrors:        make(map[string]string),
+		httpClient:      &http.Client{Timeout: 5 * time.Second},
+	}
+	state.startOfficialMarketWebSockets()
+	state.startFundingPolling()
+	return state
+}
+
+func defaultCEXSpotPerpAccounts() map[string]*strategy.SimAccount {
+	return map[string]*strategy.SimAccount{
 		"binance": {
 			Exchange:      "binance",
 			USDT:          12000,
@@ -80,29 +110,33 @@ func newCEXSpotPerpState() *cexSpotPerpState {
 			SpotBalances:  map[string]float64{"BTC": 0.02, "ETH": 1.2, "SOL": 15},
 			PerpPositions: map[string]float64{},
 		},
-	}, cfg.DefaultLeverage)
-
-	state := &cexSpotPerpState{
-		strategy:      s,
-		simulator:     sim,
-		opportunities: make(map[string]*strategy.Opportunity),
-		symbols:       cfg.Symbols,
-		marketErrors:  make(map[string]string),
-		wsStatus:      make(map[string]string),
-		wsErrors:      make(map[string]string),
-		httpClient:    &http.Client{Timeout: 5 * time.Second},
 	}
-	state.startOfficialMarketWebSockets()
-	state.startFundingPolling()
-	return state
 }
 
 func (s *cexSpotPerpState) startOfficialMarketWebSockets() {
-	go s.runBinanceBookTickerWS(strategy.MarketTypeSpot)
-	go s.runBinanceBookTickerWS(strategy.MarketTypePerp)
-	go s.runOKXTickerWS()
-	go s.runBitgetTickerWS(strategy.MarketTypeSpot)
-	go s.runBitgetTickerWS(strategy.MarketTypePerp)
+	s.mu.Lock()
+	s.wsGeneration++
+	generation := s.wsGeneration
+	s.mu.Unlock()
+	s.launchOfficialMarketWebSockets(generation)
+}
+
+func (s *cexSpotPerpState) launchOfficialMarketWebSockets(generation int64) {
+	enabled := make(map[string]bool)
+	for _, exchangeName := range s.enabledExchanges() {
+		enabled[exchangeName] = true
+	}
+	if enabled["binance"] {
+		go s.runBinanceBookTickerWS(strategy.MarketTypeSpot, generation)
+		go s.runBinanceBookTickerWS(strategy.MarketTypePerp, generation)
+	}
+	if enabled["okx"] {
+		go s.runOKXTickerWS(generation)
+	}
+	if enabled["bitget"] {
+		go s.runBitgetTickerWS(strategy.MarketTypeSpot, generation)
+		go s.runBitgetTickerWS(strategy.MarketTypePerp, generation)
+	}
 }
 
 func (s *cexSpotPerpState) startFundingPolling() {
@@ -121,8 +155,8 @@ func (s *cexSpotPerpState) pollFundingOnce() {
 	defer cancel()
 
 	var wg sync.WaitGroup
-	for _, symbol := range s.symbols {
-		for _, exchangeName := range []string{"binance", "okx", "bitget"} {
+	for _, exchangeName := range s.enabledExchanges() {
+		for _, symbol := range s.symbolsForExchange(exchangeName) {
 			wg.Add(1)
 			go func(ex, sym string) {
 				defer wg.Done()
@@ -137,6 +171,267 @@ func (s *cexSpotPerpState) pollFundingOnce() {
 		}
 	}
 	wg.Wait()
+}
+
+func (s *cexSpotPerpState) enabledSymbols() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return append([]string(nil), s.symbols...)
+}
+
+func (s *cexSpotPerpState) enabledExchanges() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return append([]string(nil), s.exchanges...)
+}
+
+func (s *cexSpotPerpState) symbolsForExchange(exchangeName string) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	enabled := false
+	for _, item := range s.exchanges {
+		if item == exchangeName {
+			enabled = true
+			break
+		}
+	}
+	if !enabled {
+		return nil
+	}
+	if symbols, ok := s.exchangeSymbols[exchangeName]; ok {
+		return append([]string(nil), symbols...)
+	}
+	return append([]string(nil), s.symbols...)
+}
+
+func (s *cexSpotPerpState) isWSGeneration(generation int64) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.wsGeneration == generation
+}
+
+func (s *cexSpotPerpState) runBinanceBookTickerWS(marketType string, generation int64) {
+	name := "binance:" + marketType
+	next := 0
+	for s.isWSGeneration(generation) {
+		s.setWSStatus(name, "connecting")
+		endpoints := s.binanceBookTickerEndpoints(marketType)
+		if len(endpoints) == 0 {
+			s.setWSError(name, fmt.Errorf("no enabled binance symbols"))
+			time.Sleep(3 * time.Second)
+			continue
+		}
+		endpoint := endpoints[next%len(endpoints)]
+		next++
+		if err := s.consumeBinanceBookTicker(name, marketType, endpoint, generation); err != nil {
+			s.setWSError(name, err)
+			time.Sleep(3 * time.Second)
+		}
+	}
+}
+
+func (s *cexSpotPerpState) binanceBookTickerEndpoints(marketType string) []string {
+	streams := make([]string, 0)
+	for _, symbol := range s.symbolsForExchange("binance") {
+		streams = append(streams, strings.ToLower(symbol)+"@bookTicker")
+	}
+	if len(streams) == 0 {
+		return nil
+	}
+	streamPath := strings.Join(streams, "/")
+	if marketType == strategy.MarketTypePerp {
+		return []string{
+			"wss://fstream.binance.com/stream?streams=" + streamPath,
+		}
+	}
+	return []string{
+		"wss://stream.binance.com:9443/stream?streams=" + streamPath,
+		"wss://stream.binance.com:443/stream?streams=" + streamPath,
+		"wss://data-stream.binance.vision/stream?streams=" + streamPath,
+	}
+}
+
+func (s *cexSpotPerpState) consumeBinanceBookTicker(name, marketType, endpoint string, generation int64) error {
+	dialer := websocket.Dialer{
+		Proxy:            http.ProxyFromEnvironment,
+		HandshakeTimeout: 8 * time.Second,
+	}
+	conn, _, err := dialer.Dial(endpoint, nil)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	s.setWSStatus(name, "connected")
+
+	for {
+		if !s.isWSGeneration(generation) {
+			return nil
+		}
+		var msg struct {
+			Data struct {
+				Symbol      string `json:"s"`
+				BidPrice    string `json:"b"`
+				BidQuantity string `json:"B"`
+				AskPrice    string `json:"a"`
+				AskQuantity string `json:"A"`
+			} `json:"data"`
+		}
+		if err := conn.ReadJSON(&msg); err != nil {
+			return err
+		}
+		if msg.Data.Symbol == "" || msg.Data.BidPrice == "" || msg.Data.AskPrice == "" {
+			continue
+		}
+		// Binance bookTicker 已经是最优买卖一档，用它做模拟盘成交价基准。
+		s.updateQuoteFromWS(quoteFromStrings("binance", msg.Data.Symbol, marketType, msg.Data.BidPrice, msg.Data.AskPrice, 0))
+	}
+}
+
+func (s *cexSpotPerpState) runOKXTickerWS(generation int64) {
+	name := "okx:public"
+	endpoints := []string{
+		"wss://ws.okx.com:8443/ws/v5/public",
+		"wss://wsaws.okx.com:8443/ws/v5/public",
+	}
+	next := 0
+	for s.isWSGeneration(generation) {
+		s.setWSStatus(name, "connecting")
+		endpoint := endpoints[next%len(endpoints)]
+		next++
+		if err := s.consumeOKXTicker(name, endpoint, generation); err != nil {
+			s.setWSError(name, err)
+			time.Sleep(3 * time.Second)
+		}
+	}
+}
+
+func (s *cexSpotPerpState) consumeOKXTicker(name, endpoint string, generation int64) error {
+	dialer := websocket.Dialer{
+		Proxy:            http.ProxyFromEnvironment,
+		HandshakeTimeout: 8 * time.Second,
+	}
+	conn, _, err := dialer.Dial(endpoint, nil)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	s.setWSStatus(name, "connected")
+
+	symbols := s.symbolsForExchange("okx")
+	if len(symbols) == 0 {
+		return fmt.Errorf("no enabled okx symbols")
+	}
+	args := make([]gin.H, 0, len(symbols)*2)
+	for _, symbol := range symbols {
+		args = append(args,
+			gin.H{"channel": "tickers", "instId": okxSpotSymbol(symbol)},
+			gin.H{"channel": "tickers", "instId": okxSwapSymbol(symbol)},
+		)
+	}
+	if err := conn.WriteJSON(gin.H{"op": "subscribe", "args": args}); err != nil {
+		return err
+	}
+
+	for {
+		if !s.isWSGeneration(generation) {
+			return nil
+		}
+		var msg struct {
+			Event string `json:"event"`
+			Arg   struct {
+				InstID string `json:"instId"`
+			} `json:"arg"`
+			Data []struct {
+				InstID string `json:"instId"`
+				BidPx  string `json:"bidPx"`
+				AskPx  string `json:"askPx"`
+			} `json:"data"`
+		}
+		if err := conn.ReadJSON(&msg); err != nil {
+			return err
+		}
+		if msg.Event != "" || len(msg.Data) == 0 {
+			continue
+		}
+		instID := msg.Data[0].InstID
+		if instID == "" {
+			instID = msg.Arg.InstID
+		}
+		marketType := strategy.MarketTypeSpot
+		symbol := okxSymbolToPlain(instID)
+		if strings.HasSuffix(instID, "-SWAP") {
+			marketType = strategy.MarketTypePerp
+		}
+		if symbol == "" || msg.Data[0].BidPx == "" || msg.Data[0].AskPx == "" {
+			continue
+		}
+		s.updateQuoteFromWS(quoteFromStrings("okx", symbol, marketType, msg.Data[0].BidPx, msg.Data[0].AskPx, 0))
+	}
+}
+
+func (s *cexSpotPerpState) runBitgetTickerWS(marketType string, generation int64) {
+	name := "bitget:" + marketType
+	for s.isWSGeneration(generation) {
+		s.setWSStatus(name, "connecting")
+		if err := s.consumeBitgetTicker(name, marketType, generation); err != nil {
+			s.setWSError(name, err)
+			time.Sleep(3 * time.Second)
+		}
+	}
+}
+
+func (s *cexSpotPerpState) consumeBitgetTicker(name, marketType string, generation int64) error {
+	dialer := websocket.Dialer{
+		Proxy:            http.ProxyFromEnvironment,
+		HandshakeTimeout: 8 * time.Second,
+	}
+	conn, _, err := dialer.Dial("wss://ws.bitget.com/v2/ws/public", nil)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	s.setWSStatus(name, "connected")
+
+	instType := "SPOT"
+	if marketType == strategy.MarketTypePerp {
+		instType = "USDT-FUTURES"
+	}
+	symbols := s.symbolsForExchange("bitget")
+	if len(symbols) == 0 {
+		return fmt.Errorf("no enabled bitget symbols")
+	}
+	args := make([]gin.H, 0, len(symbols))
+	for _, symbol := range symbols {
+		args = append(args, gin.H{"instType": instType, "channel": "ticker", "instId": symbol})
+	}
+	if err := conn.WriteJSON(gin.H{"op": "subscribe", "args": args}); err != nil {
+		return err
+	}
+
+	for {
+		if !s.isWSGeneration(generation) {
+			return nil
+		}
+		var msg struct {
+			Event string `json:"event"`
+			Arg   struct {
+				InstID string `json:"instId"`
+			} `json:"arg"`
+			Data json.RawMessage `json:"data"`
+		}
+		if err := conn.ReadJSON(&msg); err != nil {
+			return err
+		}
+		if msg.Event != "" || len(msg.Data) == 0 {
+			continue
+		}
+		ticker, err := decodeBitgetTicker(msg.Data)
+		if err != nil || msg.Arg.InstID == "" || ticker.BidPr == "" || ticker.AskPr == "" {
+			continue
+		}
+		// Bitget v2 公共 WS 同一地址承载现货和 USDT 永续，用 instType 区分市场。
+		s.updateQuoteFromWS(quoteFromStrings("bitget", msg.Arg.InstID, marketType, ticker.BidPr, ticker.AskPr, 0))
+	}
 }
 
 func (s *cexSpotPerpState) setMarketError(exchangeName, symbol, kind string, err error) {
@@ -166,9 +461,14 @@ func (s *cexSpotPerpState) setWSError(name string, err error) {
 	defer s.mu.Unlock()
 	s.wsStatus[name] = "error"
 	s.wsErrors[name] = err.Error()
+	s.lastQuoteAt = time.Now().UnixMilli()
 }
 
 func (s *cexSpotPerpState) updateQuoteFromWS(q strategy.CEXSpotPerpQuote) {
+	if q.Bid <= 0 || q.Ask <= 0 || q.Ask < q.Bid {
+		s.setMarketError(q.Exchange, q.Symbol, q.MarketType, fmt.Errorf("invalid quote bid=%f ask=%f", q.Bid, q.Ask))
+		return
+	}
 	s.strategy.UpdateQuote(q)
 	s.mu.Lock()
 	s.lastQuoteAt = time.Now().UnixMilli()
@@ -421,39 +721,121 @@ func okxSwapSymbol(symbol string) string {
 	return okxSpotSymbol(symbol) + "-SWAP"
 }
 
+func okxSymbolToPlain(instID string) string {
+	instID = strings.TrimSuffix(instID, "-SWAP")
+	return strings.ReplaceAll(instID, "-", "")
+}
+
 func (s *cexSpotPerpState) snapshot() gin.H {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	symbols := append([]string(nil), s.symbols...)
+	minProfitRate := s.minProfitRate
+	lastQuoteAt := s.lastQuoteAt
+	config := gin.H{
+		"symbols":               append([]string(nil), s.symbols...),
+		"exchanges":             append([]string(nil), s.exchanges...),
+		"exchangeSymbols":       cloneStringSliceMap(s.exchangeSymbols),
+		"leverage":              s.leverage,
+		"maxLeverage":           3,
+		"minNetProfitRate":      s.minProfitRate,
+		"carryFundingIntervals": s.strategy.Config().CarryFundingIntervals,
+	}
+	enabledQuoteSymbols := cloneStringSliceMap(s.exchangeSymbols)
+	marketErrors := make(map[string]string, len(s.marketErrors))
+	for key, value := range s.marketErrors {
+		marketErrors[key] = value
+	}
+	wsStatus := make(map[string]string, len(s.wsStatus))
+	for key, value := range s.wsStatus {
+		wsStatus[key] = value
+	}
+	wsErrors := make(map[string]string, len(s.wsErrors))
+	for key, value := range s.wsErrors {
+		wsErrors[key] = value
+	}
+	s.mu.RUnlock()
 
 	opps := make([]gin.H, 0)
-	s.opportunities = make(map[string]*strategy.Opportunity)
-	for _, symbol := range []string{"BTCUSDT", "ETHUSDT", "SOLUSDT"} {
-		for _, opp := range s.strategy.ScanSymbol(symbol) {
-			s.opportunities[opp.ID] = opp
-			opps = append(opps, opportunityDTO(opp))
+	nextOpportunities := make(map[string]*strategy.Opportunity)
+	for _, symbol := range symbols {
+		for _, opp := range s.strategy.ScanSymbolCandidates(symbol) {
+			nextOpportunities[opp.ID] = opp
+			opps = append(opps, opportunityDTO(opp, minProfitRate))
 		}
 	}
+	s.mu.Lock()
+	s.opportunities = nextOpportunities
+	s.mu.Unlock()
 
 	halted, reason := s.simulator.IsHalted()
 	status := "running"
 	if halted {
 		status = "halted"
 	}
-	marketErrors := make(map[string]string, len(s.marketErrors))
-	for key, value := range s.marketErrors {
-		marketErrors[key] = value
-	}
 
 	return gin.H{
 		"status":        status,
 		"haltReason":    reason,
+		"config":        config,
 		"accounts":      s.accountDTOs(),
+		"quotes":        quoteDTOs(s.strategy.QuoteStatuses(), enabledQuoteSymbols),
 		"opportunities": opps,
 		"positions":     positionDTOs(s.simulator.Positions()),
 		"closeActions":  closeActionDTOs(s.simulator.CloseActions()),
 		"pnl":           s.simulator.PnLSummary(),
-		"lastQuoteAt":   s.lastQuoteAt,
+		"lastQuoteAt":   lastQuoteAt,
 		"marketErrors":  marketErrors,
+		"wsStatus":      wsStatus,
+		"wsErrors":      wsErrors,
+	}
+}
+
+func quoteDTOs(quotes []strategy.CEXSpotPerpQuoteStatus, enabledSymbols map[string][]string) []gin.H {
+	result := make([]gin.H, 0, len(quotes))
+	for _, quote := range quotes {
+		if !quoteEnabled(quote.Exchange, quote.Symbol, enabledSymbols) {
+			continue
+		}
+		result = append(result, gin.H{
+			"exchange":    quote.Exchange,
+			"symbol":      quote.Symbol,
+			"marketType":  quote.MarketType,
+			"bid":         quote.Bid,
+			"ask":         quote.Ask,
+			"last":        quote.Last,
+			"fundingRate": quote.FundingRate,
+			"timestamp":   quote.Timestamp,
+			"ageMillis":   quote.AgeMillis,
+			"stale":       quote.Stale,
+		})
+	}
+	return result
+}
+
+func quoteEnabled(exchangeName, symbol string, enabledSymbols map[string][]string) bool {
+	symbols, ok := enabledSymbols[exchangeName]
+	if !ok {
+		return false
+	}
+	for _, item := range symbols {
+		if item == symbol {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *cexSpotPerpState) configDTO() gin.H {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return gin.H{
+		"symbols":               append([]string(nil), s.symbols...),
+		"exchanges":             append([]string(nil), s.exchanges...),
+		"exchangeSymbols":       cloneStringSliceMap(s.exchangeSymbols),
+		"leverage":              s.leverage,
+		"maxLeverage":           3,
+		"minNetProfitRate":      s.minProfitRate,
+		"carryFundingIntervals": s.strategy.Config().CarryFundingIntervals,
 	}
 }
 
@@ -476,31 +858,48 @@ func (s *cexSpotPerpState) accountDTOs() []gin.H {
 	return result
 }
 
-func opportunityDTO(opp *strategy.Opportunity) gin.H {
+func opportunityDTO(opp *strategy.Opportunity, minProfitRate float64) gin.H {
 	status := "ready"
 	blockReason := ""
 	if opp.NetProfit <= 0 {
-		status = "blocked"
-		blockReason = "净收益小于等于 0"
+		if opp.CarryNetProfit > 0 {
+			status = "watch"
+			blockReason = fmt.Sprintf("当前净收益小于等于 0，但 %g 期资金费率后预期为正", opp.CarryFundingIntervals)
+		} else {
+			status = "blocked"
+			blockReason = "净收益小于等于 0，持仓资金费率后仍不划算"
+		}
+	} else if opp.ProfitRate < minProfitRate {
+		if opp.CarryNetProfit > 0 {
+			status = "watch"
+			blockReason = fmt.Sprintf("当前收益率 %.4f%% 低于阈值 %.4f%%，但持仓预期为正", opp.ProfitRate, minProfitRate)
+		} else {
+			status = "blocked"
+			blockReason = fmt.Sprintf("收益率 %.4f%% 低于阈值 %.4f%%", opp.ProfitRate, minProfitRate)
+		}
 	}
 	return gin.H{
-		"id":            opp.ID,
-		"symbol":        opp.Symbol,
-		"direction":     opp.Direction,
-		"spotExchange":  opp.SpotExchange,
-		"perpExchange":  opp.PerpExchange,
-		"spotPrice":     opp.PriceA,
-		"perpPrice":     opp.PriceB,
-		"notional":      opp.Notional,
-		"basisAmount":   opp.BasisAmount,
-		"fundingAmount": opp.FundingAmount,
-		"feeCost":       opp.FeeCost,
-		"slippage":      opp.Slippage,
-		"safetyBuffer":  opp.SafetyBuffer,
-		"netProfit":     opp.NetProfit,
-		"profitRate":    opp.ProfitRate,
-		"status":        status,
-		"blockReason":   blockReason,
+		"id":                    opp.ID,
+		"symbol":                opp.Symbol,
+		"direction":             opp.Direction,
+		"spotExchange":          opp.SpotExchange,
+		"perpExchange":          opp.PerpExchange,
+		"spotPrice":             opp.PriceA,
+		"perpPrice":             opp.PriceB,
+		"notional":              opp.Notional,
+		"basisAmount":           opp.BasisAmount,
+		"fundingAmount":         opp.FundingAmount,
+		"feeCost":               opp.FeeCost,
+		"slippage":              opp.Slippage,
+		"safetyBuffer":          opp.SafetyBuffer,
+		"netProfit":             opp.NetProfit,
+		"profitRate":            opp.ProfitRate,
+		"carryFundingAmount":    opp.CarryFundingAmount,
+		"carryNetProfit":        opp.CarryNetProfit,
+		"carryProfitRate":       opp.CarryProfitRate,
+		"carryFundingIntervals": opp.CarryFundingIntervals,
+		"status":                status,
+		"blockReason":           blockReason,
 	}
 }
 
@@ -561,8 +960,176 @@ func spotPerpQuantityFromOpportunity(opp *strategy.Opportunity) float64 {
 	return opp.Legs[0].Quantity
 }
 
+type cexSpotPerpConfigRequest struct {
+	Symbols         []string            `json:"symbols"`
+	Exchanges       []string            `json:"exchanges"`
+	ExchangeSymbols map[string][]string `json:"exchangeSymbols"`
+	Leverage        float64             `json:"leverage"`
+}
+
+type cexSpotPerpAccountRequest struct {
+	USDT         float64            `json:"usdt"`
+	PerpUSDT     float64            `json:"perpUsdt"`
+	SpotBalances map[string]float64 `json:"spotBalances"`
+}
+
+type cexSpotPerpTransferRequest struct {
+	From   string  `json:"from"`
+	To     string  `json:"to"`
+	Amount float64 `json:"amount"`
+}
+
 func GetCEXSpotPerpSimulation(c *gin.Context) {
 	c.JSON(http.StatusOK, cexSpotPerpSim.snapshot())
+}
+
+func UpdateCEXSpotPerpConfig(c *gin.Context) {
+	var req cexSpotPerpConfigRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	symbols := normalizeSymbols(req.Symbols)
+	exchanges := normalizeExchanges(req.Exchanges)
+	if len(symbols) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "symbols cannot be empty"})
+		return
+	}
+	if len(exchanges) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "exchanges cannot be empty"})
+		return
+	}
+	if req.Leverage < 1 || req.Leverage > 3 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "leverage must be between 1 and 3"})
+		return
+	}
+
+	exchangeSymbols := normalizeExchangeSymbols(req.ExchangeSymbols, exchanges, symbols)
+	cexSpotPerpSim.applyConfig(symbols, exchanges, exchangeSymbols, req.Leverage)
+	c.JSON(http.StatusOK, cexSpotPerpSim.snapshot())
+}
+
+func (s *cexSpotPerpState) applyConfig(symbols, exchanges []string, exchangeSymbols map[string][]string, leverage float64) {
+	cfg := s.strategy.Config()
+	cfg.Symbols = append([]string(nil), symbols...)
+	cfg.Exchanges = append([]string(nil), exchanges...)
+	cfg.ExchangeSymbols = cloneStringSliceMap(exchangeSymbols)
+	cfg.DefaultLeverage = leverage
+	s.strategy.UpdateConfig(cfg)
+	s.simulator.SetLeverage(leverage)
+
+	s.mu.Lock()
+	s.symbols = append([]string(nil), symbols...)
+	s.exchanges = append([]string(nil), exchanges...)
+	s.exchangeSymbols = cloneStringSliceMap(exchangeSymbols)
+	s.leverage = leverage
+	s.opportunities = make(map[string]*strategy.Opportunity)
+	s.marketErrors = make(map[string]string)
+	s.wsStatus = make(map[string]string)
+	s.wsErrors = make(map[string]string)
+	s.wsGeneration++
+	generation := s.wsGeneration
+	s.mu.Unlock()
+
+	// 配置变更后重新订阅官方 WS。旧连接读循环会检测 generation 并自然退出，
+	// 这样新增币种或关闭交易所能尽快体现在行情源和机会扫描里。
+	s.launchOfficialMarketWebSockets(generation)
+}
+
+func UpdateCEXSpotPerpAccount(c *gin.Context) {
+	exchangeName := strings.ToLower(strings.TrimSpace(c.Param("exchange")))
+	var req cexSpotPerpAccountRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.SpotBalances == nil {
+		req.SpotBalances = map[string]float64{}
+	}
+	if err := cexSpotPerpSim.simulator.UpdateAccount(exchangeName, req.USDT, req.PerpUSDT, req.SpotBalances); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, cexSpotPerpSim.snapshot())
+}
+
+func TransferCEXSpotPerpAccount(c *gin.Context) {
+	exchangeName := strings.ToLower(strings.TrimSpace(c.Param("exchange")))
+	var req cexSpotPerpTransferRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := cexSpotPerpSim.simulator.TransferUSDT(exchangeName, req.From, req.To, req.Amount); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, cexSpotPerpSim.snapshot())
+}
+
+func ResetCEXSpotPerpAccounts(c *gin.Context) {
+	cexSpotPerpSim.simulator.ResetAccounts(defaultCEXSpotPerpAccounts())
+	c.JSON(http.StatusOK, cexSpotPerpSim.snapshot())
+}
+
+func normalizeSymbols(values []string) []string {
+	seen := make(map[string]bool, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		symbol := strings.ToUpper(strings.TrimSpace(value))
+		if symbol == "" || seen[symbol] {
+			continue
+		}
+		seen[symbol] = true
+		result = append(result, symbol)
+	}
+	return result
+}
+
+func normalizeExchanges(values []string) []string {
+	allowed := map[string]bool{"binance": true, "okx": true, "bitget": true}
+	seen := make(map[string]bool, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		exchangeName := strings.ToLower(strings.TrimSpace(value))
+		if !allowed[exchangeName] || seen[exchangeName] {
+			continue
+		}
+		seen[exchangeName] = true
+		result = append(result, exchangeName)
+	}
+	return result
+}
+
+func normalizeExchangeSymbols(input map[string][]string, exchanges, symbols []string) map[string][]string {
+	symbolSet := make(map[string]bool, len(symbols))
+	for _, symbol := range symbols {
+		symbolSet[symbol] = true
+	}
+	result := make(map[string][]string, len(exchanges))
+	for _, exchangeName := range exchanges {
+		candidates := symbols
+		if configured, ok := input[exchangeName]; ok {
+			candidates = normalizeSymbols(configured)
+		}
+		for _, symbol := range candidates {
+			if symbolSet[symbol] {
+				result[exchangeName] = append(result[exchangeName], symbol)
+			}
+		}
+		if len(result[exchangeName]) == 0 {
+			result[exchangeName] = append([]string(nil), symbols...)
+		}
+	}
+	return result
+}
+
+func cloneStringSliceMap(input map[string][]string) map[string][]string {
+	result := make(map[string][]string, len(input))
+	for key, value := range input {
+		result[key] = append([]string(nil), value...)
+	}
+	return result
 }
 
 func ExecuteCEXSpotPerpOpportunity(c *gin.Context) {
@@ -578,6 +1145,10 @@ func ExecuteCEXSpotPerpOpportunity(c *gin.Context) {
 	}
 	if opp == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "opportunity not found"})
+		return
+	}
+	if opp.ProfitRate < cexSpotPerpSim.minProfitRate {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "opportunity is only in observation state"})
 		return
 	}
 	if _, err := cexSpotPerpSim.simulator.ExecuteOpportunity(opp); err != nil {

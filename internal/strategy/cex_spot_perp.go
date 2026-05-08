@@ -27,6 +27,7 @@ var (
 	ErrSimInsufficientUSDT         = errors.New("insufficient simulated USDT")
 	ErrSimInsufficientInventory    = errors.New("insufficient simulated spot inventory")
 	ErrSimInsufficientMargin       = errors.New("insufficient simulated perp margin")
+	ErrSimInvalidAmount            = errors.New("invalid simulated amount")
 	ErrSimCircuitBreakerActive     = errors.New("sim circuit breaker is active")
 	ErrSimUnsupportedDirection     = errors.New("unsupported spot-perp direction")
 	ErrSimOpportunityNotProfitable = errors.New("opportunity is not profitable after costs")
@@ -47,35 +48,51 @@ type CEXSpotPerpQuote struct {
 	Timestamp   int64
 }
 
+type CEXSpotPerpQuoteStatus struct {
+	CEXSpotPerpQuote
+	AgeMillis int64
+	Stale     bool
+}
+
 // CEXSpotPerpConfig 是跨所期现策略的核心参数。第一版用固定滑点和费率，
 // 后续可以把费用模型替换成交易所/VIP 等级维度的动态配置。
 type CEXSpotPerpConfig struct {
 	Symbols                []string
 	Exchanges              []string
+	ExchangeSymbols        map[string][]string
 	NotionalUSDT           float64
 	MinNetProfitRate       float64
 	FundingIntervals       float64
+	CarryFundingIntervals  float64
 	SpotTakerFeeRate       float64
 	PerpTakerFeeRate       float64
 	SlippageRate           float64
 	SafetyBufferRate       float64
 	DefaultLeverage        float64
+	MaxQuoteAgeMillis      int64
 	EnableInventoryReverse bool
 }
 
 // DefaultCEXSpotPerpConfig 给出保守的模拟盘默认值，避免没有配置时过度高估收益。
 func DefaultCEXSpotPerpConfig() CEXSpotPerpConfig {
 	return CEXSpotPerpConfig{
-		Symbols:                []string{"BTCUSDT", "ETHUSDT", "SOLUSDT"},
-		Exchanges:              []string{"binance", "okx", "bitget"},
+		Symbols:   []string{"BTCUSDT", "ETHUSDT", "SOLUSDT"},
+		Exchanges: []string{"binance", "okx", "bitget"},
+		ExchangeSymbols: map[string][]string{
+			"binance": {"BTCUSDT", "ETHUSDT", "SOLUSDT"},
+			"okx":     {"BTCUSDT", "ETHUSDT", "SOLUSDT"},
+			"bitget":  {"BTCUSDT", "ETHUSDT", "SOLUSDT"},
+		},
 		NotionalUSDT:           1000,
 		MinNetProfitRate:       0.2,
 		FundingIntervals:       1,
+		CarryFundingIntervals:  6,
 		SpotTakerFeeRate:       0.001,
 		PerpTakerFeeRate:       0.0005,
 		SlippageRate:           0.0005,
 		SafetyBufferRate:       0.0002,
 		DefaultLeverage:        3,
+		MaxQuoteAgeMillis:      15_000,
 		EnableInventoryReverse: true,
 	}
 }
@@ -97,6 +114,18 @@ func NewCEXSpotPerpStrategy(config CEXSpotPerpConfig) *CEXSpotPerpStrategy {
 	if config.DefaultLeverage == 0 {
 		config.DefaultLeverage = 3
 	}
+	if config.FundingIntervals == 0 {
+		config.FundingIntervals = 1
+	}
+	if config.CarryFundingIntervals == 0 {
+		config.CarryFundingIntervals = config.FundingIntervals
+	}
+	if len(config.ExchangeSymbols) == 0 {
+		config.ExchangeSymbols = make(map[string][]string, len(config.Exchanges))
+		for _, exchange := range config.Exchanges {
+			config.ExchangeSymbols[exchange] = append([]string(nil), config.Symbols...)
+		}
+	}
 	return &CEXSpotPerpStrategy{
 		config:     config,
 		spotQuotes: make(map[string]map[string]CEXSpotPerpQuote),
@@ -108,9 +137,24 @@ func (s *CEXSpotPerpStrategy) SetOpportunityHandler(handler func(*Opportunity)) 
 	s.opportunityHandler = handler
 }
 
+func (s *CEXSpotPerpStrategy) Config() CEXSpotPerpConfig {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return cloneCEXSpotPerpConfig(s.config)
+}
+
+func (s *CEXSpotPerpStrategy) UpdateConfig(config CEXSpotPerpConfig) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.config = cloneCEXSpotPerpConfig(config)
+}
+
 // UpdateQuote 更新单个盘口快照。收到任一侧价格后立即扫描该 symbol，
 // 这样后续接 WebSocket 时可以做到事件驱动，而不是固定轮询。
 func (s *CEXSpotPerpStrategy) UpdateQuote(q CEXSpotPerpQuote) {
+	if q.Timestamp == 0 {
+		q.Timestamp = time.Now().UnixMilli()
+	}
 	s.mu.Lock()
 	target := s.spotQuotes
 	if q.MarketType == MarketTypePerp {
@@ -130,27 +174,88 @@ func (s *CEXSpotPerpStrategy) UpdateQuote(q CEXSpotPerpQuote) {
 	}
 }
 
+// UpdateFunding 只更新永续资金费率，不覆盖 WebSocket 已经写入的 bid/ask。
+// 资金费率通常低频变化，盘口却高频变化；分开更新可以避免 HTTP 轮询把实时盘口冲掉。
+// 注意：这里不能刷新 Timestamp。Timestamp 表示盘口价格的新鲜度，
+// 如果用资金费率轮询给旧 bid/ask 续命，会制造虚假的套利机会。
+func (s *CEXSpotPerpStrategy) UpdateFunding(q CEXSpotPerpQuote) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.perpQuotes[q.Exchange]; !ok {
+		s.perpQuotes[q.Exchange] = make(map[string]CEXSpotPerpQuote)
+	}
+	current := s.perpQuotes[q.Exchange][q.Symbol]
+	current.Exchange = q.Exchange
+	current.Symbol = q.Symbol
+	current.MarketType = MarketTypePerp
+	current.FundingRate = q.FundingRate
+	s.perpQuotes[q.Exchange][q.Symbol] = current
+}
+
 // ScanSymbol 按“任意现货所 x 任意合约所”全组合扫描机会，包括同所期现。
 func (s *CEXSpotPerpStrategy) ScanSymbol(symbol string) []*Opportunity {
+	return s.scanSymbol(symbol, true)
+}
+
+// ScanSymbolCandidates 返回所有盘口新鲜的期现组合，包括暂时达不到收益阈值的候选项。
+// 前端“机会扫描”需要看到为什么不能开仓，而不是空表让人误以为系统没工作。
+func (s *CEXSpotPerpStrategy) ScanSymbolCandidates(symbol string) []*Opportunity {
+	return s.scanSymbol(symbol, false)
+}
+
+func (s *CEXSpotPerpStrategy) QuoteStatuses() []CEXSpotPerpQuoteStatus {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	now := time.Now().UnixMilli()
+	statuses := make([]CEXSpotPerpQuoteStatus, 0)
+	appendQuotes := func(source map[string]map[string]CEXSpotPerpQuote) {
+		for _, quotes := range source {
+			for _, quote := range quotes {
+				age := int64(0)
+				if quote.Timestamp > 0 {
+					age = now - quote.Timestamp
+				}
+				statuses = append(statuses, CEXSpotPerpQuoteStatus{
+					CEXSpotPerpQuote: quote,
+					AgeMillis:        age,
+					Stale:            s.isQuoteStale(quote),
+				})
+			}
+		}
+	}
+	appendQuotes(s.spotQuotes)
+	appendQuotes(s.perpQuotes)
+	return statuses
+}
+
+func (s *CEXSpotPerpStrategy) scanSymbol(symbol string, enforceMinProfit bool) []*Opportunity {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	var opportunities []*Opportunity
 	for _, spotEx := range s.config.Exchanges {
+		if !s.isExchangeSymbolEnabled(spotEx, symbol) {
+			continue
+		}
 		spotQuote, ok := s.spotQuotes[spotEx][symbol]
-		if !ok || spotQuote.Ask <= 0 || spotQuote.Bid <= 0 {
+		if !ok || spotQuote.Ask <= 0 || spotQuote.Bid <= 0 || s.isQuoteStale(spotQuote) {
 			continue
 		}
 		for _, perpEx := range s.config.Exchanges {
-			perpQuote, ok := s.perpQuotes[perpEx][symbol]
-			if !ok || perpQuote.Ask <= 0 || perpQuote.Bid <= 0 {
+			if !s.isExchangeSymbolEnabled(perpEx, symbol) {
 				continue
 			}
-			if opp := s.buildOpportunity(spotQuote, perpQuote, DirectionSpotLongPerpShort); opp != nil {
+			perpQuote, ok := s.perpQuotes[perpEx][symbol]
+			if !ok || perpQuote.Ask <= 0 || perpQuote.Bid <= 0 || s.isQuoteStale(perpQuote) {
+				continue
+			}
+			if opp := s.buildOpportunityWithFilter(spotQuote, perpQuote, DirectionSpotLongPerpShort, enforceMinProfit); opp != nil {
 				opportunities = append(opportunities, opp)
 			}
 			if s.config.EnableInventoryReverse {
-				if opp := s.buildOpportunity(spotQuote, perpQuote, DirectionSpotShortInventoryPerpLong); opp != nil {
+				if opp := s.buildOpportunityWithFilter(spotQuote, perpQuote, DirectionSpotShortInventoryPerpLong, enforceMinProfit); opp != nil {
 					opportunities = append(opportunities, opp)
 				}
 			}
@@ -159,7 +264,31 @@ func (s *CEXSpotPerpStrategy) ScanSymbol(symbol string) []*Opportunity {
 	return opportunities
 }
 
+func (s *CEXSpotPerpStrategy) isExchangeSymbolEnabled(exchangeName, symbol string) bool {
+	symbols, ok := s.config.ExchangeSymbols[exchangeName]
+	if !ok {
+		return true
+	}
+	for _, item := range symbols {
+		if item == symbol {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *CEXSpotPerpStrategy) isQuoteStale(q CEXSpotPerpQuote) bool {
+	if s.config.MaxQuoteAgeMillis <= 0 {
+		return false
+	}
+	return q.Timestamp == 0 || time.Now().UnixMilli()-q.Timestamp > s.config.MaxQuoteAgeMillis
+}
+
 func (s *CEXSpotPerpStrategy) buildOpportunity(spot, perp CEXSpotPerpQuote, direction string) *Opportunity {
+	return s.buildOpportunityWithFilter(spot, perp, direction, true)
+}
+
+func (s *CEXSpotPerpStrategy) buildOpportunityWithFilter(spot, perp CEXSpotPerpQuote, direction string, enforceMinProfit bool) *Opportunity {
 	notional := s.config.NotionalUSDT
 	spotFee := notional * s.config.SpotTakerFeeRate
 	perpFee := notional * s.config.PerpTakerFeeRate
@@ -169,7 +298,7 @@ func (s *CEXSpotPerpStrategy) buildOpportunity(spot, perp CEXSpotPerpQuote, dire
 	slippageCost := notional * s.config.SlippageRate * 2
 	safetyBuffer := notional * s.config.SafetyBufferRate
 
-	var quantity, basisAmount, fundingAmount, spotPrice, perpPrice float64
+	var quantity, basisAmount, fundingAmount, carryFundingAmount, spotPrice, perpPrice float64
 	switch direction {
 	case DirectionSpotLongPerpShort:
 		spotPrice = spot.Ask
@@ -177,6 +306,7 @@ func (s *CEXSpotPerpStrategy) buildOpportunity(spot, perp CEXSpotPerpQuote, dire
 		quantity = notional / spotPrice
 		basisAmount = (perpPrice - spotPrice) * quantity
 		fundingAmount = notional * perp.FundingRate * s.config.FundingIntervals
+		carryFundingAmount = notional * perp.FundingRate * s.config.CarryFundingIntervals
 	case DirectionSpotShortInventoryPerpLong:
 		spotPrice = spot.Bid
 		perpPrice = perp.Ask
@@ -184,6 +314,7 @@ func (s *CEXSpotPerpStrategy) buildOpportunity(spot, perp CEXSpotPerpQuote, dire
 		basisAmount = (spotPrice - perpPrice) * quantity
 		// 负资金费率时，多永续收钱；正资金费率会成为成本。
 		fundingAmount = -notional * perp.FundingRate * s.config.FundingIntervals
+		carryFundingAmount = -notional * perp.FundingRate * s.config.CarryFundingIntervals
 	default:
 		return nil
 	}
@@ -191,33 +322,42 @@ func (s *CEXSpotPerpStrategy) buildOpportunity(spot, perp CEXSpotPerpQuote, dire
 	grossProfit := basisAmount + fundingAmount
 	netProfit := grossProfit - feeCost - slippageCost - safetyBuffer
 	profitRate := netProfit / notional * 100
-	if profitRate < s.config.MinNetProfitRate {
+	// 持仓 carry 模型用更长的资金费率期数估算，不要求当前开仓瞬间就有明显价差。
+	// 这更接近真实期现套利：小基差甚至略亏开仓，只要多期资金费率能覆盖成本，就值得进入观察。
+	carryGrossProfit := basisAmount + carryFundingAmount
+	carryNetProfit := carryGrossProfit - feeCost - slippageCost - safetyBuffer
+	carryProfitRate := carryNetProfit / notional * 100
+	if enforceMinProfit && profitRate < s.config.MinNetProfitRate {
 		return nil
 	}
 
 	opp := &Opportunity{
-		ID:            generateID("csp", direction, spot.Exchange, perp.Exchange, spot.Symbol),
-		StrategyType:  StrategyTypeCEXSpotPerp,
-		Direction:     direction,
-		Timestamp:     time.Now().UnixMilli(),
-		Notional:      notional,
-		ProfitRate:    profitRate,
-		ProfitAmount:  grossProfit,
-		BasisAmount:   basisAmount,
-		FundingAmount: fundingAmount,
-		FeeCost:       feeCost,
-		EstimatedGas:  feeCost,
-		Slippage:      slippageCost,
-		SafetyBuffer:  safetyBuffer,
-		NetProfit:     netProfit,
-		ExchangeA:     spot.Exchange,
-		ExchangeB:     perp.Exchange,
-		SpotExchange:  spot.Exchange,
-		PerpExchange:  perp.Exchange,
-		Symbol:        spot.Symbol,
-		PriceA:        spotPrice,
-		PriceB:        perpPrice,
-		Legs:          buildSpotPerpLegs(direction, spot.Exchange, perp.Exchange, spot.Symbol, quantity, spotPrice, perpPrice),
+		ID:                    generateID("csp", direction, spot.Exchange, perp.Exchange, spot.Symbol),
+		StrategyType:          StrategyTypeCEXSpotPerp,
+		Direction:             direction,
+		Timestamp:             time.Now().UnixMilli(),
+		Notional:              notional,
+		ProfitRate:            profitRate,
+		ProfitAmount:          grossProfit,
+		BasisAmount:           basisAmount,
+		FundingAmount:         fundingAmount,
+		FeeCost:               feeCost,
+		CarryFundingAmount:    carryFundingAmount,
+		CarryNetProfit:        carryNetProfit,
+		CarryProfitRate:       carryProfitRate,
+		CarryFundingIntervals: s.config.CarryFundingIntervals,
+		EstimatedGas:          feeCost,
+		Slippage:              slippageCost,
+		SafetyBuffer:          safetyBuffer,
+		NetProfit:             netProfit,
+		ExchangeA:             spot.Exchange,
+		ExchangeB:             perp.Exchange,
+		SpotExchange:          spot.Exchange,
+		PerpExchange:          perp.Exchange,
+		Symbol:                spot.Symbol,
+		PriceA:                spotPrice,
+		PriceB:                perpPrice,
+		Legs:                  buildSpotPerpLegs(direction, spot.Exchange, perp.Exchange, spot.Symbol, quantity, spotPrice, perpPrice),
 	}
 	return opp
 }
@@ -246,10 +386,25 @@ func (s *CEXSpotPerpStrategy) GetConfig() map[string]interface{} {
 		"type":                     StrategyTypeCEXSpotPerp,
 		"symbols":                  s.config.Symbols,
 		"exchanges":                s.config.Exchanges,
+		"exchange_symbols":         s.config.ExchangeSymbols,
 		"notional_usdt":            s.config.NotionalUSDT,
 		"min_net_profit_rate":      s.config.MinNetProfitRate,
+		"funding_intervals":        s.config.FundingIntervals,
+		"carry_funding_intervals":  s.config.CarryFundingIntervals,
+		"max_quote_age_millis":     s.config.MaxQuoteAgeMillis,
 		"enable_inventory_reverse": s.config.EnableInventoryReverse,
 	}
+}
+
+func cloneCEXSpotPerpConfig(config CEXSpotPerpConfig) CEXSpotPerpConfig {
+	config.Symbols = append([]string(nil), config.Symbols...)
+	config.Exchanges = append([]string(nil), config.Exchanges...)
+	cloned := make(map[string][]string, len(config.ExchangeSymbols))
+	for exchange, symbols := range config.ExchangeSymbols {
+		cloned[exchange] = append([]string(nil), symbols...)
+	}
+	config.ExchangeSymbols = cloned
+	return config
 }
 
 // SimAccount 是每个交易所独立的模拟账户。跨所套利不能把资金当作全局池，
@@ -308,6 +463,9 @@ func NewCEXSpotPerpSimulator(accounts map[string]*SimAccount, leverage float64) 
 	if leverage <= 0 {
 		leverage = 3
 	}
+	if leverage > 3 {
+		leverage = 3
+	}
 	cp := make(map[string]*SimAccount, len(accounts))
 	for name, account := range accounts {
 		cp[name] = cloneSimAccount(account)
@@ -317,6 +475,20 @@ func NewCEXSpotPerpSimulator(accounts map[string]*SimAccount, leverage float64) 
 		positions: make(map[string]*SimArbitragePosition),
 		leverage:  leverage,
 	}
+}
+
+func (s *CEXSpotPerpSimulator) SetLeverage(leverage float64) {
+	if leverage <= 0 {
+		leverage = 1
+	}
+	if leverage > 3 {
+		leverage = 3
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// 第一版明确把模拟合约杠杆限制在 3 倍以内，避免前端或外部调用绕过 API 校验后
+	// 低估保证金占用。实盘时还要结合交易所逐仓/全仓规则再次校验。
+	s.leverage = leverage
 }
 
 func cloneSimAccount(account *SimAccount) *SimAccount {
@@ -335,11 +507,106 @@ func cloneSimAccount(account *SimAccount) *SimAccount {
 	return &cloned
 }
 
+func (s *CEXSpotPerpSimulator) Accounts() []*SimAccount {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := make([]*SimAccount, 0, len(s.accounts))
+	for _, account := range s.accounts {
+		result = append(result, cloneSimAccount(account))
+	}
+	return result
+}
+
 func (s *CEXSpotPerpSimulator) Account(exchangeName string) (*SimAccount, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	account, ok := s.accounts[exchangeName]
 	return cloneSimAccount(account), ok
+}
+
+func (s *CEXSpotPerpSimulator) UpdateAccount(exchangeName string, usdt, perpUSDT float64, spotBalances map[string]float64) error {
+	if usdt < 0 || perpUSDT < 0 {
+		return ErrSimInvalidAmount
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	account, ok := s.accounts[exchangeName]
+	if !ok || account == nil {
+		return fmt.Errorf("%w: %s", ErrSimAccountNotFound, exchangeName)
+	}
+	if perpUSDT+1e-12 < account.FrozenUSDT {
+		return ErrSimInsufficientMargin
+	}
+
+	normalizedBalances := make(map[string]float64, len(spotBalances))
+	for asset, balance := range spotBalances {
+		asset = strings.ToUpper(strings.TrimSpace(asset))
+		if asset == "" {
+			continue
+		}
+		if balance < 0 {
+			return ErrSimInvalidAmount
+		}
+		normalizedBalances[asset] = balance
+	}
+
+	// 资金管理允许调整模拟盘初始资金和手动库存，但保留已开永续持仓和冻结保证金。
+	// 这样不会因为页面改配置把已经建立的对冲关系悄悄抹掉。
+	account.USDT = usdt
+	account.PerpUSDT = perpUSDT
+	account.SpotBalances = normalizedBalances
+	if account.PerpPositions == nil {
+		account.PerpPositions = make(map[string]float64)
+	}
+	return nil
+}
+
+func (s *CEXSpotPerpSimulator) TransferUSDT(exchangeName, from, to string, amount float64) error {
+	if amount <= 0 {
+		return ErrSimInvalidAmount
+	}
+	from = strings.ToLower(strings.TrimSpace(from))
+	to = strings.ToLower(strings.TrimSpace(to))
+	if from == to || (from != MarketTypeSpot && from != MarketTypePerp) || (to != MarketTypeSpot && to != MarketTypePerp) {
+		return ErrSimInvalidAmount
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	account, ok := s.accounts[exchangeName]
+	if !ok || account == nil {
+		return fmt.Errorf("%w: %s", ErrSimAccountNotFound, exchangeName)
+	}
+
+	switch from {
+	case MarketTypeSpot:
+		if account.USDT+1e-12 < amount {
+			return ErrSimInsufficientUSDT
+		}
+		account.USDT -= amount
+		account.PerpUSDT += amount
+	case MarketTypePerp:
+		available := account.PerpUSDT - account.FrozenUSDT
+		if available+1e-12 < amount {
+			return ErrSimInsufficientMargin
+		}
+		account.PerpUSDT -= amount
+		account.USDT += amount
+	}
+	return nil
+}
+
+func (s *CEXSpotPerpSimulator) ResetAccounts(accounts map[string]*SimAccount) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.accounts = make(map[string]*SimAccount, len(accounts))
+	for name, account := range accounts {
+		s.accounts[name] = cloneSimAccount(account)
+	}
+	s.positions = make(map[string]*SimArbitragePosition)
+	s.closeActions = nil
+	s.halted = false
+	s.haltReason = ""
 }
 
 func (s *CEXSpotPerpSimulator) Positions() []*SimArbitragePosition {

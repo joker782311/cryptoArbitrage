@@ -5,6 +5,16 @@ import api from '@/api'
 export type SpotPerpDirection = 'spot_long_perp_short' | 'spot_short_inventory_perp_long'
 export type MarketStatus = 'running' | 'halted'
 
+export interface SpotPerpConfig {
+  symbols: string[]
+  exchanges: string[]
+  exchangeSymbols: Record<string, string[]>
+  leverage: number
+  maxLeverage: number
+  minNetProfitRate: number
+  carryFundingIntervals: number
+}
+
 export interface SimAccount {
   exchange: string
   usdt: number
@@ -12,6 +22,19 @@ export interface SimAccount {
   frozenUsdt: number
   spotBalances: Record<string, number>
   perpPositions: Record<string, number>
+}
+
+export interface MarketQuote {
+  exchange: string
+  symbol: string
+  marketType: 'spot' | 'perp'
+  bid: number
+  ask: number
+  last: number
+  fundingRate: number
+  timestamp: number
+  ageMillis: number
+  stale: boolean
 }
 
 export interface SpotPerpOpportunity {
@@ -30,7 +53,11 @@ export interface SpotPerpOpportunity {
   safetyBuffer: number
   netProfit: number
   profitRate: number
-  status: 'ready' | 'blocked'
+  carryFundingAmount: number
+  carryNetProfit: number
+  carryProfitRate: number
+  carryFundingIntervals: number
+  status: 'ready' | 'watch' | 'blocked'
   blockReason?: string
 }
 
@@ -67,7 +94,11 @@ interface SimulationSnapshot {
   haltReason: string
   lastQuoteAt: number
   marketErrors: Record<string, string>
+  wsStatus: Record<string, string>
+  wsErrors: Record<string, string>
+  config: SpotPerpConfig
   accounts: SimAccount[]
+  quotes: MarketQuote[]
   opportunities: SpotPerpOpportunity[]
   positions: SimPosition[]
   closeActions: CloseAction[]
@@ -84,12 +115,28 @@ export const useCexSpotPerpStore = defineStore('cexSpotPerp', () => {
   const wsConnected = ref(false)
   const status = ref<MarketStatus>('running')
   const haltReason = ref('')
+  const config = ref<SpotPerpConfig>({
+    symbols: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'],
+    exchanges: ['binance', 'okx', 'bitget'],
+    exchangeSymbols: {
+      binance: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'],
+      okx: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'],
+      bitget: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'],
+    },
+    leverage: 3,
+    maxLeverage: 3,
+    minNetProfitRate: 0.05,
+    carryFundingIntervals: 6,
+  })
   const accounts = ref<SimAccount[]>([])
+  const quotes = ref<MarketQuote[]>([])
   const opportunities = ref<SpotPerpOpportunity[]>([])
   const positions = ref<SimPosition[]>([])
   const closeActions = ref<CloseAction[]>([])
   const lastQuoteAt = ref(0)
   const marketErrors = ref<Record<string, string>>({})
+  const wsStatus = ref<Record<string, string>>({})
+  const wsErrors = ref<Record<string, string>>({})
   const pnl = ref({
     realizedPnL: 0,
     unrealizedPnL: 0,
@@ -101,6 +148,7 @@ export const useCexSpotPerpStore = defineStore('cexSpotPerp', () => {
   const totalPerpUsdt = computed(() => accounts.value.reduce((sum, account) => sum + account.perpUsdt, 0))
   const totalFrozenUsdt = computed(() => accounts.value.reduce((sum, account) => sum + account.frozenUsdt, 0))
   const readyOpportunities = computed(() => opportunities.value.filter(opp => opp.status === 'ready'))
+  const watchOpportunities = computed(() => opportunities.value.filter(opp => opp.status === 'watch'))
   const openPositions = computed(() => positions.value.filter(position => position.status === 'open'))
   let ws: WebSocket | null = null
   let reconnectTimer: number | undefined
@@ -108,12 +156,16 @@ export const useCexSpotPerpStore = defineStore('cexSpotPerp', () => {
   function hydrate(snapshot: SimulationSnapshot) {
     status.value = snapshot.status
     haltReason.value = snapshot.haltReason || ''
+    config.value = snapshot.config || config.value
     accounts.value = snapshot.accounts || []
+    quotes.value = snapshot.quotes || []
     opportunities.value = snapshot.opportunities || []
     positions.value = snapshot.positions || []
     closeActions.value = snapshot.closeActions || []
     lastQuoteAt.value = snapshot.lastQuoteAt || 0
     marketErrors.value = snapshot.marketErrors || {}
+    wsStatus.value = snapshot.wsStatus || {}
+    wsErrors.value = snapshot.wsErrors || {}
     pnl.value = snapshot.pnl || { realizedPnL: 0, unrealizedPnL: 0, totalPnL: 0, openNotional: 0 }
   }
 
@@ -187,22 +239,55 @@ export const useCexSpotPerpStore = defineStore('cexSpotPerp', () => {
     hydrate(response)
   }
 
+  async function updateConfig(nextConfig: SpotPerpConfig) {
+    const response = await api.put('/cex-spot-perp/config', nextConfig) as unknown as SimulationSnapshot
+    hydrate(response)
+  }
+
+  async function updateAccount(account: SimAccount) {
+    const response = await api.put(`/cex-spot-perp/accounts/${encodeURIComponent(account.exchange)}`, {
+      usdt: account.usdt,
+      perpUsdt: account.perpUsdt,
+      spotBalances: account.spotBalances,
+    }) as unknown as SimulationSnapshot
+    hydrate(response)
+  }
+
+  async function transferAccountUSDT(exchange: string, from: 'spot' | 'perp', to: 'spot' | 'perp', amount: number) {
+    const response = await api.post(`/cex-spot-perp/accounts/${encodeURIComponent(exchange)}/transfer`, {
+      from,
+      to,
+      amount,
+    }) as unknown as SimulationSnapshot
+    hydrate(response)
+  }
+
+  async function resetAccounts() {
+    const response = await api.post('/cex-spot-perp/accounts/reset') as unknown as SimulationSnapshot
+    hydrate(response)
+  }
+
   return {
     loading,
     wsConnected,
     status,
     haltReason,
+    config,
     accounts,
+    quotes,
     opportunities,
     positions,
     closeActions,
     lastQuoteAt,
     marketErrors,
+    wsStatus,
+    wsErrors,
     pnl,
     totalSpotUsdt,
     totalPerpUsdt,
     totalFrozenUsdt,
     readyOpportunities,
+    watchOpportunities,
     openPositions,
     fetchSimulation,
     connectWebSocket,
@@ -211,5 +296,9 @@ export const useCexSpotPerpStore = defineStore('cexSpotPerp', () => {
     closePosition,
     triggerCircuitBreaker,
     resumeSimulation,
+    updateConfig,
+    updateAccount,
+    transferAccountUSDT,
+    resetAccounts,
   }
 })

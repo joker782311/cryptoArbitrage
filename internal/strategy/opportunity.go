@@ -2,17 +2,21 @@ package strategy
 
 // Opportunity 套利机会
 type Opportunity struct {
-	ID            string  `json:"id"`
-	StrategyType  string  `json:"strategy_type"`       // cross_exchange, funding_rate, spot_future, triangular, dex_triangular, dex_cross_dex
-	Direction     string  `json:"direction,omitempty"` // spot_long_perp_short, spot_short_inventory_perp_long
-	Timestamp     int64   `json:"timestamp"`
-	Notional      float64 `json:"notional,omitempty"`       // 本次机会使用的名义本金 (USDT)
-	ProfitRate    float64 `json:"profit_rate"`              // 利润率 (%)
-	ProfitAmount  float64 `json:"profit_amount"`            // 预估利润金额 (USDT)
-	BasisAmount   float64 `json:"basis_amount,omitempty"`   // 基差贡献 (USDT)
-	FundingAmount float64 `json:"funding_amount,omitempty"` // 预计资金费率贡献 (USDT)
-	FeeCost       float64 `json:"fee_cost,omitempty"`       // 交易手续费 (USDT)
-	SafetyBuffer  float64 `json:"safety_buffer,omitempty"`  // 安全缓冲 (USDT)
+	ID                    string  `json:"id"`
+	StrategyType          string  `json:"strategy_type"`       // cross_exchange, funding_rate, spot_future, triangular, dex_triangular, dex_cross_dex
+	Direction             string  `json:"direction,omitempty"` // spot_long_perp_short, spot_short_inventory_perp_long
+	Timestamp             int64   `json:"timestamp"`
+	Notional              float64 `json:"notional,omitempty"`                // 本次机会使用的名义本金 (USDT)
+	ProfitRate            float64 `json:"profit_rate"`                       // 利润率 (%)
+	ProfitAmount          float64 `json:"profit_amount"`                     // 预估利润金额 (USDT)
+	BasisAmount           float64 `json:"basis_amount,omitempty"`            // 基差贡献 (USDT)
+	FundingAmount         float64 `json:"funding_amount,omitempty"`          // 预计资金费率贡献 (USDT)
+	FeeCost               float64 `json:"fee_cost,omitempty"`                // 交易手续费 (USDT)
+	SafetyBuffer          float64 `json:"safety_buffer,omitempty"`           // 安全缓冲 (USDT)
+	CarryFundingAmount    float64 `json:"carry_funding_amount,omitempty"`    // 多期持仓资金费率贡献 (USDT)
+	CarryNetProfit        float64 `json:"carry_net_profit,omitempty"`        // 多期持仓预期净收益 (USDT)
+	CarryProfitRate       float64 `json:"carry_profit_rate,omitempty"`       // 多期持仓预期收益率 (%)
+	CarryFundingIntervals float64 `json:"carry_funding_intervals,omitempty"` // 多期持仓估算使用的资金费率期数
 
 	// 跨交易所字段
 	ExchangeA    string  `json:"exchange_a,omitempty"`

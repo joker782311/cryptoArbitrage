@@ -14,6 +14,9 @@
         <el-tag :type="wsConnected ? 'success' : 'warning'" size="large">
           {{ wsConnected ? 'WebSocket 实时' : 'WebSocket 重连中' }}
         </el-tag>
+        <el-tag :type="marketWSConnectedCount > 0 ? 'success' : 'warning'" size="large">
+          官方行情 {{ marketWSConnectedCount }}/{{ marketWSTotalCount }}
+        </el-tag>
         <el-button :icon="Refresh" @click="store.fetchSimulation()">刷新</el-button>
         <el-button v-if="status === 'running'" type="danger" :icon="SwitchButton" @click="handleHalt">
           熔断清仓
@@ -38,8 +41,63 @@
       type="warning"
       :closable="false"
       show-icon
-      :title="`部分行情源更新失败：${Object.keys(marketErrors).length} 项`"
+      :title="`部分资金费率更新失败：${Object.keys(marketErrors).length} 项`"
     />
+    <el-alert
+      v-if="Object.keys(wsErrors).length > 0"
+      class="halt-alert"
+      type="warning"
+      :closable="false"
+      show-icon
+      :title="`官方交易所 WebSocket 连接失败：${Object.keys(wsErrors).length} 路`"
+    />
+
+    <el-card shadow="never" class="config-panel">
+      <el-form label-width="110px" class="config-form">
+        <el-form-item label="合约杠杆">
+          <div class="leverage-control">
+            <el-slider v-model="draftConfig.leverage" :min="1" :max="3" :step="0.1" />
+            <el-input-number v-model="draftConfig.leverage" :min="1" :max="3" :step="0.1" :precision="1" />
+          </div>
+        </el-form-item>
+        <el-form-item label="交易所">
+          <el-checkbox-group v-model="draftConfig.exchanges">
+            <el-checkbox-button v-for="exchange in allExchanges" :key="exchange" :label="exchange">
+              {{ exchange }}
+            </el-checkbox-button>
+          </el-checkbox-group>
+        </el-form-item>
+        <el-form-item label="币种白名单">
+          <el-select
+            v-model="draftConfig.symbols"
+            multiple
+            filterable
+            allow-create
+            default-first-option
+            class="wide-select"
+            placeholder="输入交易对，例如 BTCUSDT"
+          >
+            <el-option v-for="symbol in commonSymbols" :key="symbol" :label="symbol" :value="symbol" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="各所币种">
+          <div class="exchange-symbols">
+            <div v-for="exchange in draftConfig.exchanges" :key="exchange" class="exchange-symbol-row">
+              <span class="exchange-label">{{ exchange }}</span>
+              <el-select v-model="draftConfig.exchangeSymbols[exchange]" multiple filterable class="exchange-symbol-select">
+                <el-option v-for="symbol in draftConfig.symbols" :key="`${exchange}-${symbol}`" :label="symbol" :value="symbol" />
+              </el-select>
+            </div>
+          </div>
+        </el-form-item>
+        <el-form-item>
+          <el-button type="primary" :icon="Setting" @click="saveConfig">保存配置</el-button>
+          <el-button v-if="hasUnsavedConfig" @click="resetDraftConfig">放弃修改</el-button>
+          <el-tag v-if="hasUnsavedConfig" type="warning" effect="plain">有未保存配置</el-tag>
+          <span class="muted">杠杆上限 3 倍，配置保存后会重新订阅行情源。</span>
+        </el-form-item>
+      </el-form>
+    </el-card>
 
     <el-row :gutter="16" class="summary-row">
       <el-col :xs="24" :sm="12" :lg="6">
@@ -89,15 +147,21 @@
       </el-col>
       <el-col :xs="24" :sm="8">
         <el-card shadow="never" class="metric-card small">
-          <div class="metric-label">可执行机会</div>
-          <div class="metric-value small-value">{{ readyOpportunities.length }}</div>
+          <div class="metric-label">可执行 / 观察机会</div>
+          <div class="metric-value small-value">{{ readyOpportunities.length }} / {{ watchOpportunities.length }}</div>
         </el-card>
       </el-col>
     </el-row>
 
     <el-tabs model-value="opportunities" class="main-tabs">
       <el-tab-pane label="机会扫描" name="opportunities">
-        <el-table :data="opportunities" stripe v-loading="loading" class="data-table">
+        <el-table
+          :data="opportunities"
+          stripe
+          v-loading="loading"
+          class="data-table"
+          empty-text="暂无可扫描组合：等待至少一条现货行情和一条永续行情同时在线"
+        >
           <el-table-column prop="symbol" label="交易对" min-width="110" />
           <el-table-column label="方向" min-width="170">
             <template #default="{ row }">
@@ -127,6 +191,14 @@
               <span :class="row.fundingAmount >= 0 ? 'text-up' : 'text-down'">{{ signedMoney(row.fundingAmount) }}</span>
             </template>
           </el-table-column>
+          <el-table-column label="持仓资金费" min-width="120">
+            <template #default="{ row }">
+              <span :class="row.carryFundingAmount >= 0 ? 'text-up' : 'text-down'">
+                {{ signedMoney(row.carryFundingAmount) }}
+              </span>
+              <span class="muted"> / {{ row.carryFundingIntervals }}期</span>
+            </template>
+          </el-table-column>
           <el-table-column label="成本" min-width="130">
             <template #default="{ row }">{{ money(row.feeCost + row.slippage + row.safetyBuffer) }}</template>
           </el-table-column>
@@ -138,10 +210,21 @@
           <el-table-column label="收益率" min-width="90">
             <template #default="{ row }">{{ row.profitRate.toFixed(2) }}%</template>
           </el-table-column>
+          <el-table-column label="持仓预期" min-width="130">
+            <template #default="{ row }">
+              <span :class="row.carryNetProfit >= 0 ? 'text-up strong' : 'text-down strong'">
+                {{ signedMoney(row.carryNetProfit) }}
+              </span>
+              <span class="muted"> {{ row.carryProfitRate.toFixed(2) }}%</span>
+            </template>
+          </el-table-column>
           <el-table-column label="状态" min-width="120">
             <template #default="{ row }">
               <el-tooltip v-if="row.status === 'blocked'" :content="row.blockReason" placement="top">
                 <el-tag type="info">不可执行</el-tag>
+              </el-tooltip>
+              <el-tooltip v-else-if="row.status === 'watch'" :content="row.blockReason" placement="top">
+                <el-tag type="warning">观察</el-tag>
               </el-tooltip>
               <el-tag v-else type="success">可执行</el-tag>
             </template>
@@ -162,7 +245,87 @@
         </el-table>
       </el-tab-pane>
 
+      <el-tab-pane label="行情源" name="quotes">
+        <el-table :data="quotes" stripe class="data-table" empty-text="暂无行情快照">
+          <el-table-column prop="exchange" label="交易所" min-width="110">
+            <template #default="{ row }">
+              <el-tag :type="exchangeType(row.exchange)">{{ row.exchange }}</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column prop="symbol" label="交易对" min-width="110" />
+          <el-table-column label="市场" min-width="90">
+            <template #default="{ row }">
+              <el-tag :type="row.marketType === 'spot' ? 'success' : 'warning'">
+                {{ row.marketType === 'spot' ? '现货' : '永续' }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="买一价" min-width="120">
+            <template #default="{ row }">{{ money(row.bid) }}</template>
+          </el-table-column>
+          <el-table-column label="卖一价" min-width="120">
+            <template #default="{ row }">{{ money(row.ask) }}</template>
+          </el-table-column>
+          <el-table-column label="资金费率" min-width="110">
+            <template #default="{ row }">
+              {{ row.marketType === 'perp' ? `${(row.fundingRate * 100).toFixed(4)}%` : '-' }}
+            </template>
+          </el-table-column>
+          <el-table-column label="状态" min-width="110">
+            <template #default="{ row }">
+              <el-tag :type="row.stale ? 'danger' : 'success'">{{ row.stale ? '过期' : '实时' }}</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="年龄" min-width="110">
+            <template #default="{ row }">{{ quoteAgeText(row.ageMillis) }}</template>
+          </el-table-column>
+          <el-table-column label="更新时间" min-width="180">
+            <template #default="{ row }">{{ formatTs(row.timestamp) }}</template>
+          </el-table-column>
+        </el-table>
+      </el-tab-pane>
+
       <el-tab-pane label="虚拟资金" name="accounts">
+        <div class="fund-manager">
+          <el-form label-width="110px" class="fund-form">
+            <el-form-item label="交易所">
+              <el-select v-model="fundDraft.exchange" class="fund-select" @change="loadFundDraft">
+                <el-option v-for="account in accounts" :key="account.exchange" :label="account.exchange" :value="account.exchange" />
+              </el-select>
+            </el-form-item>
+            <el-form-item label="现货 USDT">
+              <el-input-number v-model="fundDraft.usdt" :min="0" :precision="2" :step="100" />
+            </el-form-item>
+            <el-form-item label="合约 USDT">
+              <el-input-number v-model="fundDraft.perpUsdt" :min="fundDraft.frozenUsdt" :precision="2" :step="100" />
+              <span class="muted">需大于冻结保证金 {{ money(fundDraft.frozenUsdt) }}</span>
+            </el-form-item>
+            <el-form-item label="现货库存">
+              <div class="inventory-editor">
+                <div v-for="item in fundDraft.spotBalances" :key="item.asset" class="inventory-row">
+                  <el-input v-model="item.asset" placeholder="BTC" />
+                  <el-input-number v-model="item.amount" :min="0" :precision="6" :step="0.01" />
+                  <el-button :icon="CloseBold" @click="removeInventoryAsset(item.asset)" />
+                </div>
+                <el-button @click="addInventoryAsset">添加库存币种</el-button>
+              </div>
+            </el-form-item>
+            <el-form-item label="资金划转">
+              <div class="transfer-row">
+                <el-segmented v-model="transferDraft.direction" :options="transferOptions" />
+                <el-input-number v-model="transferDraft.amount" :min="0" :precision="2" :step="100" />
+                <el-button @click="handleTransfer">模拟划转</el-button>
+              </div>
+            </el-form-item>
+            <el-form-item>
+              <el-button type="primary" @click="saveFundDraft">保存资金</el-button>
+              <el-button @click="loadFundDraft">重载当前交易所</el-button>
+              <el-button type="danger" plain @click="handleResetAccounts">恢复默认资金</el-button>
+              <span class="muted">资金配置保存在后端模拟盘内存里，用于开仓前余额、库存和保证金检查。</span>
+            </el-form-item>
+          </el-form>
+        </div>
+
         <el-table :data="accounts" stripe class="data-table">
           <el-table-column prop="exchange" label="交易所" min-width="110">
             <template #default="{ row }">
@@ -281,11 +444,11 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, onUnmounted } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
-import { ElMessageBox } from 'element-plus'
-import { CaretRight, CloseBold, Refresh, SwitchButton, VideoPlay } from '@element-plus/icons-vue'
-import { useCexSpotPerpStore, type SpotPerpDirection } from '@/stores/cexSpotPerp'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { CaretRight, CloseBold, Refresh, Setting, SwitchButton, VideoPlay } from '@element-plus/icons-vue'
+import { useCexSpotPerpStore, type SpotPerpConfig, type SpotPerpDirection } from '@/stores/cexSpotPerp'
 
 const store = useCexSpotPerpStore()
 const {
@@ -293,23 +456,112 @@ const {
   wsConnected,
   status,
   haltReason,
+  config,
   accounts,
+  quotes,
   opportunities,
   positions,
   closeActions,
   lastQuoteAt,
   marketErrors,
+  wsStatus,
+  wsErrors,
   pnl,
   totalSpotUsdt,
   totalPerpUsdt,
   totalFrozenUsdt,
   readyOpportunities,
+  watchOpportunities,
 } = storeToRefs(store)
+
+const allExchanges = ['binance', 'okx', 'bitget']
+const commonSymbols = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT', 'DOGEUSDT']
+const configDraftStorageKey = 'cex-spot-perp-config-draft'
+
+const cloneConfig = (value: SpotPerpConfig): SpotPerpConfig => ({
+  ...value,
+  symbols: [...value.symbols],
+  exchanges: [...value.exchanges],
+  exchangeSymbols: Object.fromEntries(
+    Object.entries(value.exchangeSymbols || {}).map(([exchange, symbols]) => [exchange, [...symbols]])
+  ),
+})
+
+const configKey = (value: SpotPerpConfig) => JSON.stringify({
+  symbols: value.symbols,
+  exchanges: value.exchanges,
+  exchangeSymbols: value.exchangeSymbols,
+  leverage: value.leverage,
+})
+
+const readStoredDraftConfig = (): SpotPerpConfig | null => {
+  const raw = window.localStorage.getItem(configDraftStorageKey)
+  if (!raw) return null
+  try {
+    return cloneConfig(JSON.parse(raw) as SpotPerpConfig)
+  } catch {
+    window.localStorage.removeItem(configDraftStorageKey)
+    return null
+  }
+}
+
+const storedDraftConfig = readStoredDraftConfig()
+const draftConfig = reactive<SpotPerpConfig>(storedDraftConfig || cloneConfig(config.value))
+const savedConfigKey = ref(configKey(config.value))
+const isSyncingDraft = ref(false)
+const hasUnsavedConfig = ref(Boolean(storedDraftConfig))
+const fundDraft = reactive({
+  exchange: 'binance',
+  usdt: 0,
+  perpUsdt: 0,
+  frozenUsdt: 0,
+  spotBalances: [] as Array<{ asset: string; amount: number }>,
+})
+const transferDraft = reactive({
+  direction: 'spot_to_perp',
+  amount: 0,
+})
+const transferOptions = [
+  { label: '现货 -> 合约', value: 'spot_to_perp' },
+  { label: '合约 -> 现货', value: 'perp_to_spot' },
+]
+
+const marketWSConnectedCount = computed(() => {
+  return Object.values(wsStatus.value).filter(status => status === 'connected').length
+})
+const marketWSTotalCount = computed(() => Math.max(Object.keys(wsStatus.value).length, 5))
 
 onMounted(() => {
   store.fetchSimulation()
   store.connectWebSocket()
 })
+
+watch(config, (value) => {
+  savedConfigKey.value = configKey(value)
+  if (hasUnsavedConfig.value) return
+  isSyncingDraft.value = true
+  Object.assign(draftConfig, cloneConfig(value))
+  isSyncingDraft.value = false
+}, { deep: true })
+
+watch(draftConfig, () => {
+  if (isSyncingDraft.value) return
+  hasUnsavedConfig.value = configKey(draftConfig) !== savedConfigKey.value
+  if (hasUnsavedConfig.value) {
+    window.localStorage.setItem(configDraftStorageKey, JSON.stringify(draftConfig))
+  } else {
+    window.localStorage.removeItem(configDraftStorageKey)
+  }
+}, { deep: true })
+
+watch(accounts, () => {
+  if (!accounts.value.some(account => account.exchange === fundDraft.exchange)) {
+    fundDraft.exchange = accounts.value[0]?.exchange || 'binance'
+  }
+  if (fundDraft.usdt === 0 && fundDraft.perpUsdt === 0 && fundDraft.spotBalances.length === 0) {
+    loadFundDraft()
+  }
+}, { deep: true })
 
 onUnmounted(() => {
   store.disconnectWebSocket()
@@ -334,6 +586,128 @@ const money = (value: number) => {
 
 const signedMoney = (value: number) => {
   return `${value >= 0 ? '+' : '-'}${money(Math.abs(value))}`
+}
+
+const normalizeDraftConfig = (): SpotPerpConfig => {
+  const symbols = [...new Set(draftConfig.symbols.map(symbol => symbol.trim().toUpperCase()).filter(Boolean))]
+  const exchanges = [...new Set(draftConfig.exchanges.filter(exchange => allExchanges.includes(exchange)))]
+  const exchangeSymbols: Record<string, string[]> = {}
+  for (const exchange of exchanges) {
+    const configured = draftConfig.exchangeSymbols[exchange] || symbols
+    exchangeSymbols[exchange] = configured.filter(symbol => symbols.includes(symbol))
+    if (exchangeSymbols[exchange].length === 0) {
+      exchangeSymbols[exchange] = [...symbols]
+    }
+  }
+  return {
+    ...draftConfig,
+    symbols,
+    exchanges,
+    exchangeSymbols,
+    leverage: Math.min(3, Math.max(1, Number(draftConfig.leverage || 1))),
+  }
+}
+
+const saveConfig = async () => {
+  const nextConfig = normalizeDraftConfig()
+  if (nextConfig.symbols.length === 0 || nextConfig.exchanges.length === 0) {
+    ElMessage.warning('至少配置一个交易所和一个币种')
+    return
+  }
+  await store.updateConfig(nextConfig)
+  isSyncingDraft.value = true
+  Object.assign(draftConfig, cloneConfig(nextConfig))
+  savedConfigKey.value = configKey(nextConfig)
+  hasUnsavedConfig.value = false
+  window.localStorage.removeItem(configDraftStorageKey)
+  isSyncingDraft.value = false
+  ElMessage.success('期现配置已保存')
+}
+
+const resetDraftConfig = () => {
+  isSyncingDraft.value = true
+  Object.assign(draftConfig, cloneConfig(config.value))
+  window.localStorage.removeItem(configDraftStorageKey)
+  hasUnsavedConfig.value = false
+  isSyncingDraft.value = false
+}
+
+const accountForFundDraft = () => {
+  return accounts.value.find(account => account.exchange === fundDraft.exchange)
+}
+
+const loadFundDraft = () => {
+  const account = accountForFundDraft()
+  if (!account) return
+  fundDraft.usdt = account.usdt
+  fundDraft.perpUsdt = account.perpUsdt
+  fundDraft.frozenUsdt = account.frozenUsdt
+  fundDraft.spotBalances = Object.entries(account.spotBalances || {}).map(([asset, amount]) => ({
+    asset,
+    amount,
+  }))
+}
+
+const addInventoryAsset = () => {
+  fundDraft.spotBalances.push({ asset: '', amount: 0 })
+}
+
+const removeInventoryAsset = (asset: string) => {
+  fundDraft.spotBalances = fundDraft.spotBalances.filter(item => item.asset !== asset)
+}
+
+const normalizedSpotBalances = () => {
+  const balances: Record<string, number> = {}
+  for (const item of fundDraft.spotBalances) {
+    const asset = item.asset.trim().toUpperCase()
+    if (!asset) continue
+    balances[asset] = Math.max(0, Number(item.amount || 0))
+  }
+  return balances
+}
+
+const saveFundDraft = async () => {
+  if (!fundDraft.exchange) return
+  await store.updateAccount({
+    exchange: fundDraft.exchange,
+    usdt: Number(fundDraft.usdt || 0),
+    perpUsdt: Number(fundDraft.perpUsdt || 0),
+    frozenUsdt: fundDraft.frozenUsdt,
+    spotBalances: normalizedSpotBalances(),
+    perpPositions: accountForFundDraft()?.perpPositions || {},
+  })
+  loadFundDraft()
+  ElMessage.success('模拟资金已保存')
+}
+
+const handleTransfer = async () => {
+  if (!fundDraft.exchange || transferDraft.amount <= 0) {
+    ElMessage.warning('请输入划转金额')
+    return
+  }
+  const from = transferDraft.direction === 'spot_to_perp' ? 'spot' : 'perp'
+  const to = transferDraft.direction === 'spot_to_perp' ? 'perp' : 'spot'
+  await store.transferAccountUSDT(fundDraft.exchange, from, to, transferDraft.amount)
+  transferDraft.amount = 0
+  loadFundDraft()
+  ElMessage.success('模拟划转完成')
+}
+
+const handleResetAccounts = async () => {
+  await ElMessageBox.confirm('恢复默认资金会清空当前模拟持仓和熔断动作。', '确认恢复默认资金', {
+    type: 'warning',
+    confirmButtonText: '恢复默认',
+    cancelButtonText: '取消',
+  })
+  await store.resetAccounts()
+  loadFundDraft()
+  ElMessage.success('模拟资金已恢复默认')
+}
+
+const quoteAgeText = (value: number) => {
+  if (!value) return '-'
+  if (value < 1000) return `${value}ms`
+  return `${(value / 1000).toFixed(1)}s`
 }
 
 const handleHalt = async () => {
@@ -425,6 +799,90 @@ h2 {
   margin-bottom: 16px;
 }
 
+.config-panel {
+  margin-bottom: 16px;
+  border-radius: 6px;
+}
+
+.config-form {
+  max-width: 980px;
+}
+
+.leverage-control {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) 140px;
+  gap: 16px;
+  width: 100%;
+  max-width: 520px;
+  align-items: center;
+}
+
+.wide-select {
+  width: 100%;
+  max-width: 520px;
+}
+
+.exchange-symbols {
+  display: grid;
+  gap: 10px;
+  width: 100%;
+  max-width: 680px;
+}
+
+.exchange-symbol-row {
+  display: grid;
+  grid-template-columns: 82px minmax(0, 1fr);
+  gap: 12px;
+  align-items: center;
+}
+
+.exchange-label {
+  color: #374151;
+  font-weight: 650;
+  text-transform: capitalize;
+}
+
+.exchange-symbol-select {
+  width: 100%;
+}
+
+.fund-manager {
+  margin-bottom: 16px;
+  padding: 16px;
+  border: 1px solid #ebeef5;
+  border-radius: 6px;
+  background: #fff;
+}
+
+.fund-form {
+  max-width: 980px;
+}
+
+.fund-select {
+  width: 220px;
+}
+
+.inventory-editor {
+  display: grid;
+  gap: 10px;
+  width: 100%;
+  max-width: 560px;
+}
+
+.inventory-row {
+  display: grid;
+  grid-template-columns: 140px 220px 40px;
+  gap: 10px;
+  align-items: center;
+}
+
+.transfer-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+}
+
 .summary-row.secondary {
   margin-top: -8px;
 }
@@ -509,6 +967,12 @@ h2 {
   .header-actions {
     justify-content: flex-start;
     margin-top: 12px;
+  }
+
+  .leverage-control,
+  .exchange-symbol-row,
+  .inventory-row {
+    grid-template-columns: 1fr;
   }
 }
 </style>

@@ -16,6 +16,8 @@ export default defineConfig({
     },
   },
   server: {
+    host: true,
+    allowedHosts: ['5jld5m9clgo4.ngrok.xiaomiqiu123.top'],
     proxy: {
       '/api': {
         target: 'http://localhost:8080',

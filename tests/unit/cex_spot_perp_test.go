@@ -16,6 +16,7 @@ func testSpotPerpConfig() strategy.CEXSpotPerpConfig {
 		NotionalUSDT:           1000,
 		MinNetProfitRate:       0.01,
 		FundingIntervals:       1,
+		CarryFundingIntervals:  6,
 		SpotTakerFeeRate:       0.001,
 		PerpTakerFeeRate:       0.0005,
 		SlippageRate:           0.0005,
@@ -23,6 +24,26 @@ func testSpotPerpConfig() strategy.CEXSpotPerpConfig {
 		DefaultLeverage:        3,
 		EnableInventoryReverse: true,
 	}
+}
+
+func TestCEXSpotPerp_CarryCandidateCanBeObservedBeforeExecutable(t *testing.T) {
+	cfg := testSpotPerpConfig()
+	cfg.MinNetProfitRate = 0.2
+	cfg.CarryFundingIntervals = 8
+	s := strategy.NewCEXSpotPerpStrategy(cfg)
+	s.UpdateQuote(strategy.CEXSpotPerpQuote{Exchange: "binance", Symbol: "BTCUSDT", MarketType: strategy.MarketTypeSpot, Bid: 9999, Ask: 10000})
+	s.UpdateQuote(strategy.CEXSpotPerpQuote{Exchange: "okx", Symbol: "BTCUSDT", MarketType: strategy.MarketTypePerp, Bid: 10002, Ask: 10003, FundingRate: 0.0005})
+
+	executable := s.ScanSymbol("BTCUSDT")
+	require.Empty(t, executable)
+
+	candidates := s.ScanSymbolCandidates("BTCUSDT")
+	require.NotEmpty(t, candidates)
+	found := candidates[0]
+	assert.Less(t, found.ProfitRate, cfg.MinNetProfitRate)
+	assert.Greater(t, found.CarryFundingAmount, found.FundingAmount)
+	assert.Greater(t, found.CarryNetProfit, 0.0)
+	assert.Equal(t, cfg.CarryFundingIntervals, found.CarryFundingIntervals)
 }
 
 func TestCEXSpotPerp_LongSpotShortPerpProfit(t *testing.T) {
